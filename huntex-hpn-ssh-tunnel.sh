@@ -7,37 +7,10 @@ set -Eeuo pipefail
 #  - Builds & installs HPN-SSH into: /usr/local/hpnssh
 #  - Runs hpnsshd on PORT (default 2222) as a separate systemd service
 #  - Keeps system sshd on port 22 untouched
-#  - Auto-fixes common failures:
-#      * "Privilege separation user hpnsshd does not exist"
-#      * missing /var/empty
-#      * systemd start-limit after repeated failures
-#      * config test before start
-#
-#  Commands:
-#    ./huntex-hpn-ssh-tunnel.sh install
-#    ./huntex-hpn-ssh-tunnel.sh status
-#    ./huntex-hpn-ssh-tunnel.sh logs
-#    ./huntex-hpn-ssh-tunnel.sh uninstall
-#
-#  Environment overrides (optional):
-#    PORT=2222
-#    SERVICE=hpnsshd
-#    PREFIX=/usr/local/hpnssh
-#    SYSCONFDIR=/etc/hpnssh
-#    WORKDIR=/root/hpn-build
-#    LOGDIR=/root/hpn-logs
-#    HPN_REPO=https://github.com/rapier1/hpn-ssh.git
-#    MAKE_JOBS=1
-#
-#  Security toggles:
-#    PERMIT_ROOT_LOGIN=yes|prohibit-password
-#    PASSWORD_AUTH=yes|no
-#    KBDINT_AUTH=yes|no
-#
 # ============================================================
 
 APP_NAME="HuntexHPN-SSH-Tunnel"
-APP_VER="1.0.8"
+APP_VER="1.0.9"
 
 # -----------------------
 # Defaults (override via env)
@@ -59,11 +32,22 @@ PASSWORD_AUTH="${PASSWORD_AUTH:-yes}"
 KBDINT_AUTH="${KBDINT_AUTH:-yes}"
 
 # -----------------------
+# Reliability / Iran-tuned (safe defaults)
+# -----------------------
+USE_DNS="${USE_DNS:-no}"
+LOGIN_GRACE_TIME="${LOGIN_GRACE_TIME:-60}"
+MAX_AUTH_TRIES="${MAX_AUTH_TRIES:-6}"
+LOG_LEVEL="${LOG_LEVEL:-DEBUG2}"   # helpful; later you can lower to VERBOSE
+
+# Prefer standard OpenSSH cipher set (avoid weird edge cases)
+CIPHERS="${CIPHERS:-chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr}"
+MACS="${MACS:-hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-256,hmac-sha2-512}"
+
+# -----------------------
 # Colors / UI
 # -----------------------
 C_RESET=$'\033[0m'
 C_BOLD=$'\033[1m'
-C_DIM=$'\033[2m'
 C_BLUE=$'\033[38;5;39m'
 C_CYAN=$'\033[38;5;51m'
 C_GREEN=$'\033[38;5;82m'
@@ -72,13 +56,6 @@ C_RED=$'\033[38;5;196m'
 C_GRAY=$'\033[38;5;245m'
 C_TITLE=$'\033[38;5;178m'
 
-hr() { echo -e "${C_CYAN}════════════════════════════════════════════════════════════${C_RESET}"; }
-title() {
-  hr
-  echo -e "${C_TITLE}${C_BOLD}${APP_NAME}${C_RESET} ${C_GRAY}v${APP_VER}${C_RESET}"
-  echo -e "${C_GRAY}HPN-SSH separate instance on port ${C_BOLD}${PORT}${C_RESET}${C_GRAY}; system sshd stays on 22${C_RESET}"
-  hr
-}
 ts() { date '+%F %T'; }
 log()  { echo -e "${C_GRAY}[$(ts)]${C_RESET} $*"; }
 step() { echo -e "${C_BLUE}${C_BOLD}[*]${C_RESET} ${C_BLUE}$*${C_RESET}"; }
@@ -88,10 +65,28 @@ die()  { echo -e "${C_RED}${C_BOLD}[FATAL]${C_RESET} $*" >&2; exit 1; }
 
 need_root() { [[ "${EUID}" -eq 0 ]] || die "Run as root (sudo)."; }
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
-ensure_dir() { mkdir -p "$1"; }
 
 # -----------------------
-# Logging
+# Pretty header
+# -----------------------
+banner() {
+  clear || true
+  echo -e "${C_TITLE}${C_BOLD}"
+  cat <<'BANNER'
+██╗  ██╗██╗   ██╗███╗   ███╗████████╗███████╗██╗  ██╗
+██║  ██║██║   ██║████╗ ████║╚══██╔══╝██╔════╝╚██╗██╔╝
+███████║██║   ██║██╔████╔██║   ██║   █████╗   ╚███╔╝
+██╔══██║██║   ██║██║╚██╔╝██║   ██║   ██╔══╝   ██╔██╗
+██║  ██║╚██████╔╝██║ ╚═╝ ██║   ██║   ███████╗██╔╝ ██╗
+╚═╝  ╚═╝ ╚═════╝ ╚═╝     ╚═╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
+BANNER
+  echo -e "${C_RESET}${C_GRAY}HPN-SSH-Tunnel${C_RESET}\n"
+  echo -e "${C_GRAY}${APP_NAME} v${APP_VER} | Port: ${PORT} | Service: ${SERVICE}${C_RESET}"
+  echo
+}
+
+# -----------------------
+# Logging files
 # -----------------------
 APTLOG="$LOGDIR/apt.log"
 GITLOG="$LOGDIR/git.log"
@@ -100,17 +95,18 @@ INSLOG="$LOGDIR/install.log"
 SVCLOG="$LOGDIR/service.log"
 RUNTIMELOG="/var/log/${SERVICE}.log"
 
+ensure_dir() { mkdir -p "$1"; }
+
 runlog() {
   local logfile="$1"; shift
   ensure_dir "$(dirname "$logfile")"
-  log "LOG: $logfile"
-  log "CMD: $*"
+  log "LOG -> $logfile"
+  log "CMD -> $*"
   bash -lc "$*" >>"$logfile" 2>&1
 }
 
 wait_apt_locks() {
-  local max=180
-  local i=0
+  local max=180 i=0
   while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
      || fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
     ((i++)) || true
@@ -126,22 +122,40 @@ detect_ubuntu() {
   [[ -f /etc/os-release ]] || die "Cannot detect OS. /etc/os-release missing."
   # shellcheck disable=SC1091
   . /etc/os-release
-  [[ "${ID:-}" == "ubuntu" ]] || warn "This script is tested on Ubuntu. Detected: ${ID:-unknown} ${VERSION_ID:-}"
+  [[ "${ID:-}" == "ubuntu" ]] || warn "Tested on Ubuntu. Detected: ${ID:-unknown} ${VERSION_ID:-}"
 }
 
-# ============================================================
-# (1/4) NEW: Detect whether hpnsshd supports "UsePAM"
-# ============================================================
-supports_usepam() {
-  # returns 0 if the daemon accepts "UsePAM", otherwise 1
+# Pick a hostkey path that EXISTS for option testing (fix: avoid false negatives)
+pick_test_hostkey() {
+  local k=""
+  for k in \
+    "${SYSCONFDIR}/ssh_host_ed25519_key" \
+    "/etc/ssh/ssh_host_ed25519_key" \
+    "${SYSCONFDIR}/ssh_host_rsa_key" \
+    "/etc/ssh/ssh_host_rsa_key"
+  do
+    if [[ -f "$k" ]]; then
+      echo "$k"
+      return 0
+    fi
+  done
+  # If nothing exists, we still return the common path (test will fail safely)
+  echo "/etc/ssh/ssh_host_ed25519_key"
+}
+
+# Detect whether hpnsshd supports an option (like UsePAM / UseDNS)
+supports_option() {
   local bin="$1"
+  local opt_line="$2"
+  local hk
+  hk="$(pick_test_hostkey)"
   local tmp
   tmp="$(mktemp)"
-  cat >"$tmp" <<'EOF'
+  cat >"$tmp" <<EOF
 Port 0
 ListenAddress 127.0.0.1
-HostKey /etc/ssh/ssh_host_ed25519_key
-UsePAM yes
+HostKey ${hk}
+${opt_line}
 EOF
   "$bin" -t -f "$tmp" >/dev/null 2>&1
   local rc=$?
@@ -149,11 +163,23 @@ EOF
   return $rc
 }
 
+detect_sftp_server() {
+  local p=""
+  for p in \
+    /usr/lib/openssh/sftp-server \
+    /usr/lib/ssh/sftp-server \
+    /usr/libexec/openssh/sftp-server
+  do
+    [[ -x "$p" ]] && { echo "$p"; return 0; }
+  done
+  echo "/usr/lib/openssh/sftp-server"
+}
+
 # -----------------------
 # Core actions
 # -----------------------
 install_deps() {
-  step "Installing build dependencies (apt)..."
+  step "Installing build dependencies..."
   wait_apt_locks
   runlog "$APTLOG" "export DEBIAN_FRONTEND=noninteractive;
     apt-get update -y &&
@@ -190,9 +216,7 @@ clone_build_install() {
 
 locate_hpnsshd() {
   local bin="${PREFIX}/sbin/hpnsshd"
-  if [[ -x "$bin" ]]; then
-    echo "$bin"; return 0
-  fi
+  [[ -x "$bin" ]] && { echo "$bin"; return 0; }
   bin="$(find "$PREFIX" -maxdepth 6 -type f -name 'hpnsshd' -perm -111 2>/dev/null | head -n 1 || true)"
   [[ -n "$bin" && -x "$bin" ]] || die "Could not find installed hpnsshd under $PREFIX"
   echo "$bin"
@@ -206,7 +230,6 @@ ensure_privsep_user() {
   else
     ok "User hpnsshd already exists"
   fi
-
   mkdir -p /var/empty
   chown root:root /var/empty
   chmod 755 /var/empty
@@ -237,15 +260,27 @@ write_config() {
 
   step "Writing config: ${cfg}"
 
-  # ============================================================
-  # (2/4) NEW: Build a safe UsePAM line only if supported
-  # ============================================================
   local USEPAM_LINE=""
-  if supports_usepam "$hpnsshd_bin"; then
+  if supports_option "$hpnsshd_bin" "UsePAM yes"; then
     USEPAM_LINE="UsePAM yes"
+    ok "UsePAM supported -> enabled"
   else
-    USEPAM_LINE="" # Unsupported -> do not write it (prevents your error)
+    USEPAM_LINE=""
+    ok "UsePAM NOT supported -> skipped"
   fi
+
+  local USEDNS_LINE=""
+  if supports_option "$hpnsshd_bin" "UseDNS no"; then
+    USEDNS_LINE="UseDNS ${USE_DNS}"
+    ok "UseDNS supported -> ${USE_DNS}"
+  else
+    USEDNS_LINE=""
+    ok "UseDNS NOT supported -> skipped"
+  fi
+
+  local SFTP_SERVER
+  SFTP_SERVER="$(detect_sftp_server)"
+  ok "sftp-server -> ${SFTP_SERVER}"
 
   cat > "$cfg" <<CFGEOF
 # ============================================================
@@ -256,18 +291,26 @@ Port ${PORT}
 ListenAddress 0.0.0.0
 ListenAddress ::
 
-# Keep pid under systemd runtime dir
 PidFile /run/${SERVICE}/${SERVICE}.pid
 
-# Host keys (generated by installer)
 HostKey ${SYSCONFDIR}/ssh_host_ed25519_key
 HostKey ${SYSCONFDIR}/ssh_host_rsa_key
 
-# --- Security knobs (override by env at install time)
+# --- Security
 PermitRootLogin ${PERMIT_ROOT_LOGIN}
 PasswordAuthentication ${PASSWORD_AUTH}
 KbdInteractiveAuthentication ${KBDINT_AUTH}
 ${USEPAM_LINE}
+
+# --- Reliability
+${USEDNS_LINE}
+LoginGraceTime ${LOGIN_GRACE_TIME}
+MaxAuthTries ${MAX_AUTH_TRIES}
+LogLevel ${LOG_LEVEL}
+
+# --- Crypto
+Ciphers ${CIPHERS}
+MACs ${MACS}
 
 # --- Tunnel / forwarding
 AllowTcpForwarding yes
@@ -278,12 +321,8 @@ TCPKeepAlive yes
 ClientAliveInterval 60
 ClientAliveCountMax 3
 
-# --- Quality
 Compression no
-LogLevel VERBOSE
-
-# Use your system sftp-server (Ubuntu path)
-Subsystem sftp /usr/lib/openssh/sftp-server
+Subsystem sftp ${SFTP_SERVER}
 CFGEOF
 
   ok "Config written."
@@ -308,7 +347,6 @@ RuntimeDirectory=${SERVICE}
 RuntimeDirectoryMode=0755
 
 ExecStartPre=${hpnsshd_bin} -t -f ${cfg}
-
 ExecStart=${hpnsshd_bin} -D -f ${cfg} -E ${RUNTIMELOG}
 ExecReload=/bin/kill -HUP \$MAINPID
 
@@ -329,16 +367,20 @@ start_service() {
   runlog "$SVCLOG" "systemctl enable --now '${SERVICE}.service'"
 
   echo
-  ok "Service status:"
-  systemctl --no-pager --full status "${SERVICE}.service" | sed -n '1,60p' || true
+  ok "Service status (short):"
+  systemctl --no-pager --full status "${SERVICE}.service" | sed -n '1,35p' || true
   echo
 
-  ok "Listening ports:"
+  ok "Listening:"
   ss -lntp | grep -E ":(22|${PORT})\b" || true
+
+  echo
+  ok "Last logs (service):"
+  journalctl -u "${SERVICE}.service" --no-pager -n 20 || true
 }
 
 status_cmd() {
-  title
+  banner
   ok "Ports:"
   ss -lntp | grep -E ":(22|${PORT})\b" || true
   echo
@@ -347,19 +389,19 @@ status_cmd() {
 }
 
 logs_cmd() {
-  title
-  ok "Journal (last 120 lines):"
-  journalctl -u "${SERVICE}.service" --no-pager -n 120 || true
+  banner
+  ok "Journal (last 200 lines):"
+  journalctl -u "${SERVICE}.service" --no-pager -n 200 || true
   echo
   ok "Runtime log: ${RUNTIMELOG}"
-  tail -n 120 "${RUNTIMELOG}" 2>/dev/null || true
+  tail -n 200 "${RUNTIMELOG}" 2>/dev/null || true
 }
 
 uninstall_cmd() {
-  title
+  banner
   warn "Uninstalling ${APP_NAME}..."
-  warn "This removes: service + config + install prefix."
-  warn "It does NOT remove: user 'hpnsshd' and /var/empty (safe)."
+  warn "Removes: service + config + install prefix."
+  warn "Does NOT remove: user 'hpnsshd' and /var/empty (safe)."
 
   systemctl stop "${SERVICE}.service" 2>/dev/null || true
   systemctl disable "${SERVICE}.service" 2>/dev/null || true
@@ -372,16 +414,15 @@ uninstall_cmd() {
   rm -f "$RUNTIMELOG" || true
 
   ok "Uninstalled."
-  ok "If you want to remove the privsep user too (optional):"
+  echo -e "${C_GRAY}Optional cleanup:${C_RESET}"
   echo -e "  ${C_DIM}sudo userdel hpnsshd 2>/dev/null; sudo rm -rf /var/empty${C_RESET}"
 }
 
 install_cmd() {
-  title
+  banner
   detect_ubuntu
-
   has_cmd systemctl || die "systemd is required (systemctl not found)."
-  has_cmd ss || warn "'ss' not found? Install iproute2 if needed."
+  has_cmd ss || warn "'ss' not found? install iproute2."
 
   install_deps
   clone_build_install
@@ -394,27 +435,20 @@ install_cmd() {
   ensure_privsep_user
   ensure_host_keys
 
-  # ============================================================
-  # (3/4) NEW: provide daemon path before cfg generation
-  # ============================================================
   HPNSSHD_BIN="$hpnsshd_bin"
-
   write_config
   write_systemd_unit "$hpnsshd_bin"
   start_service
 
-  hr
+  echo
   ok "DONE ✅"
-  echo -e "${C_GRAY}Connect test from another server:${C_RESET}"
-  echo -e "  ${C_BOLD}ssh -p ${PORT} root@YOUR_SERVER_IP${C_RESET}"
-  hr
-  echo -e "${C_YELLOW}${C_BOLD}NOTE:${C_RESET} ${C_GRAY}Defaults are PASSWORD_AUTH=yes (as you requested). After you set keys, you can harden: PASSWORD_AUTH=no PERMIT_ROOT_LOGIN=prohibit-password${C_RESET}"
+  echo -e "${C_GRAY}Test:${C_RESET}  ${C_BOLD}ssh -p ${PORT} root@YOUR_SERVER_IP${C_RESET}"
+  echo -e "${C_GRAY}Logs:${C_RESET}  ${C_BOLD}journalctl -u ${SERVICE} -f${C_RESET}  |  ${C_BOLD}tail -f ${RUNTIMELOG}${C_RESET}"
 }
 
 usage() {
+  banner
   cat <<USAGE
-${APP_NAME} v${APP_VER}
-
 Usage:
   sudo ./${0##*/} install
   sudo ./${0##*/} status
@@ -426,6 +460,12 @@ Env overrides:
   PERMIT_ROOT_LOGIN=prohibit-password|yes
   PASSWORD_AUTH=no|yes
   KBDINT_AUTH=no|yes
+  USE_DNS=no
+  LOGIN_GRACE_TIME=60
+  MAX_AUTH_TRIES=6
+  LOG_LEVEL=DEBUG2|VERBOSE
+  CIPHERS="..."
+  MACS="..."
 USAGE
 }
 
@@ -441,11 +481,5 @@ main() {
   esac
 }
 
-# ============================================================
-# (4/4) NEW: Ensure we're root (install/uninstall) earlier
-# (Low risk: doesn't change behavior unless not root)
-# ============================================================
 need_root
-
 main "$@"
-```0
