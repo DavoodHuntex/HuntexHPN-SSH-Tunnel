@@ -407,6 +407,5 @@ main() {
 }
 
 main "$@"
-EOF
 
 chmod +x huntex-hpn-ssh-tunnel.sh
