@@ -37,7 +37,7 @@ set -Eeuo pipefail
 # ============================================================
 
 APP_NAME="HuntexHPN-SSH-Tunnel"
-APP_VER="1.0.6"
+APP_VER="1.0.7"
 
 # -----------------------
 # Defaults (override via env)
@@ -52,9 +52,10 @@ HPN_REPO="${HPN_REPO:-https://github.com/rapier1/hpn-ssh.git}"
 MAKE_JOBS="${MAKE_JOBS:-1}"
 
 # Security defaults (safe-ish for public servers)
-PERMIT_ROOT_LOGIN="${PERMIT_ROOT_LOGIN:-prohibit-password}"
-PASSWORD_AUTH="${PASSWORD_AUTH:-no}"
-KBDINT_AUTH="${KBDINT_AUTH:-no}"
+# Security defaults
+PERMIT_ROOT_LOGIN="${PERMIT_ROOT_LOGIN:-yes}"
+PASSWORD_AUTH="${PASSWORD_AUTH:-yes}"
+KBDINT_AUTH="${KBDINT_AUTH:-yes}"
 
 # -----------------------
 # Colors / UI
@@ -209,6 +210,23 @@ ensure_host_keys() {
 }
 
 # IMPORTANT: we only touch UsePAM here (fixes your error) and keep everything else same.
+supports_usepam() {
+  # returns 0 if the daemon accepts "UsePAM", otherwise 1
+  local bin="$1"
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<'EOF'
+Port 2222
+ListenAddress 127.0.0.1
+HostKey /etc/ssh/ssh_host_ed25519_key
+UsePAM yes
+EOF
+  "$bin" -t -f "$tmp" >/dev/null 2>&1
+  local rc=$?
+  rm -f "$tmp"
+  return $rc
+}
+
 write_config() {
   local cfg="$SYSCONFDIR/hpnsshd_config"
   local hpnsshd_bin="${HPNSSHD_BIN:-}"
