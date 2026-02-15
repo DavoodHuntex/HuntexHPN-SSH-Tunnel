@@ -37,8 +37,7 @@ set -Eeuo pipefail
 # ============================================================
 
 APP_NAME="HuntexHPN-SSH-Tunnel"
-APP_VER="1.0.0"
-
+APP_VER="1.0.6"
 
 # -----------------------
 # Defaults (override via env)
@@ -53,9 +52,9 @@ HPN_REPO="${HPN_REPO:-https://github.com/rapier1/hpn-ssh.git}"
 MAKE_JOBS="${MAKE_JOBS:-1}"
 
 # Security defaults (safe-ish for public servers)
-PERMIT_ROOT_LOGIN="${PERMIT_ROOT_LOGIN:-prohibit-password}" # recommended; set "yes" if you insist
-PASSWORD_AUTH="${PASSWORD_AUTH:-no}"                        # recommended; set "yes" to allow passwords
-KBDINT_AUTH="${KBDINT_AUTH:-no}"                            # recommended; set "yes" to allow keyboard-interactive
+PERMIT_ROOT_LOGIN="${PERMIT_ROOT_LOGIN:-prohibit-password}"
+PASSWORD_AUTH="${PASSWORD_AUTH:-no}"
+KBDINT_AUTH="${KBDINT_AUTH:-no}"
 
 # -----------------------
 # Colors / UI
@@ -178,7 +177,6 @@ locate_hpnsshd() {
 }
 
 ensure_privsep_user() {
-  # Fix for: "Privilege separation user hpnsshd does not exist"
   step "Ensuring PrivSep user 'hpnsshd' + /var/empty..."
   if ! id -u hpnsshd >/dev/null 2>&1; then
     runlog "$INSLOG" "useradd --system --home /var/empty --shell /usr/sbin/nologin --comment 'HPN-SSH PrivSep' hpnsshd"
@@ -205,15 +203,42 @@ ensure_host_keys() {
     ok "Host keys already exist."
   fi
 
-  # sshd is picky about permissions
   chmod 700 "$SYSCONFDIR"
   chmod 600 "$SYSCONFDIR"/ssh_host_*_key 2>/dev/null || true
   chmod 644 "$SYSCONFDIR"/ssh_host_*_key.pub 2>/dev/null || true
 }
 
+# IMPORTANT: we only touch UsePAM here (fixes your error) and keep everything else same.
 write_config() {
   local cfg="$SYSCONFDIR/hpnsshd_config"
+  local hpnsshd_bin="${HPNSSHD_BIN:-}"
+  [[ -n "$hpnsshd_bin" && -x "$hpnsshd_bin" ]] || die "Internal error: HPNSSHD_BIN not set before write_config()"
+
   step "Writing config: ${cfg}"
+
+  # ---- Option support detection (low-risk)
+  supports_option() {
+    local opt="$1"
+    local tmp
+    tmp="$(mktemp)"
+    cat >"$tmp" <<EOFCONF
+Port 0
+ListenAddress 127.0.0.1
+HostKey ${SYSCONFDIR}/ssh_host_ed25519_key
+${opt}
+EOFCONF
+    "$hpnsshd_bin" -t -f "$tmp" >/dev/null 2>&1
+    local rc=$?
+    rm -f "$tmp"
+    return $rc
+  }
+
+  local USEPAM_LINE=""
+  if supports_option "UsePAM no"; then
+    USEPAM_LINE="UsePAM yes"
+  else
+    USEPAM_LINE=""  # HPN build doesn't support UsePAM -> do not write it
+  fi
 
   cat > "$cfg" <<CFGEOF
 # ============================================================
@@ -235,7 +260,7 @@ HostKey ${SYSCONFDIR}/ssh_host_rsa_key
 PermitRootLogin ${PERMIT_ROOT_LOGIN}
 PasswordAuthentication ${PASSWORD_AUTH}
 KbdInteractiveAuthentication ${KBDINT_AUTH}
-UsePAM yes
+${USEPAM_LINE}
 
 # --- Tunnel / forwarding
 AllowTcpForwarding yes
@@ -267,7 +292,6 @@ write_systemd_unit() {
 [Unit]
 Description=HPN-SSH server (separate instance on port ${PORT})
 After=network.target
-# Avoid aggressive restart loops
 StartLimitIntervalSec=60
 StartLimitBurst=10
 
@@ -276,7 +300,6 @@ Type=simple
 RuntimeDirectory=${SERVICE}
 RuntimeDirectoryMode=0755
 
-# Validate config before starting
 ExecStartPre=${hpnsshd_bin} -t -f ${cfg}
 
 ExecStart=${hpnsshd_bin} -D -f ${cfg} -E ${RUNTIMELOG}
@@ -298,7 +321,6 @@ start_service() {
   runlog "$SVCLOG" "systemctl reset-failed '${SERVICE}.service' || true"
   runlog "$SVCLOG" "systemctl enable --now '${SERVICE}.service'"
 
-  # show short status
   echo
   ok "Service status:"
   systemctl --no-pager --full status "${SERVICE}.service" | sed -n '1,60p' || true
@@ -364,7 +386,11 @@ install_cmd() {
 
   ensure_privsep_user
   ensure_host_keys
+
+  # Provide the daemon path to write_config() for option detection
+  HPNSSHD_BIN="$hpnsshd_bin"
   write_config
+
   write_systemd_unit "$hpnsshd_bin"
   start_service
 
