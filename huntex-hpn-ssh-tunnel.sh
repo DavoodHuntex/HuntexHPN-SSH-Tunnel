@@ -317,12 +317,14 @@ supports_option() {
   local hk tmp
   hk="$(pick_test_hostkey)"
   tmp="$(mktemp)"
+
   cat >"$tmp" <<EOF
-Port 0
+Port 65534
 ListenAddress 127.0.0.1
 HostKey ${hk}
 ${opt_line}
 EOF
+
   "$bin" -t -f "$tmp" >/dev/null 2>&1
   local rc=$?
   rm -f "$tmp"
