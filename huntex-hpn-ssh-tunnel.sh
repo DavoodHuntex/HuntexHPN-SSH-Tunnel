@@ -1,271 +1,274 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-# ============================================================
-# HUNTEX HPN-SSHD (NO-PAM / NO-CHALLENGE) - Ubuntu systemd
-# - Installs HPN-SSH to /usr/local/hpnssh
-# - Runs separate hpnsshd on PORT (default 2222)
-# - Disables PAM + keyboard-interactive/challenge safely
-# ============================================================
-
-PORT="${PORT:-2222}"
-SERVICE="${SERVICE:-hpnsshd}"
-PREFIX="${PREFIX:-/usr/local/hpnssh}"
-SYSCONFDIR="${SYSCONFDIR:-/etc/hpnssh}"
-WORKDIR="${WORKDIR:-/root/hpn-build}"
-HPN_REPO="${HPN_REPO:-https://github.com/rapier1/hpn-ssh.git}"
-MAKE_JOBS="${MAKE_JOBS:-1}"
-
-# Keep password auth ON (but NO PAM/challenge)
-PERMIT_ROOT_LOGIN="${PERMIT_ROOT_LOGIN:-yes}"
-PASSWORD_AUTH="${PASSWORD_AUTH:-yes}"
-
-# Reliability defaults
-USE_DNS="${USE_DNS:-no}"
-LOGIN_GRACE_TIME="${LOGIN_GRACE_TIME:-180}"
-MAX_AUTH_TRIES="${MAX_AUTH_TRIES:-10}"
-LOG_LEVEL="${LOG_LEVEL:-VERBOSE}"
-
-# Crypto (safe + includes HPN mt if client supports)
-CIPHERS="${CIPHERS:-chacha20-poly1305-mt@hpnssh.org,chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr}"
-
-RUNTIMELOG="/var/log/${SERVICE}.log"
-
-die(){ echo "[FATAL] $*" >&2; exit 1; }
-log(){ echo "[*] $*"; }
-ok(){  echo "[+] $*"; }
-warn(){ echo "[!] $*"; }
-
-need_root(){ [[ $EUID -eq 0 ]] || die "Run as root."; }
-has(){ command -v "$1" >/dev/null 2>&1; }
-
-ensure_deps(){
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y >/dev/null 2>&1 || true
-  apt-get install -y --no-install-recommends \
-    ca-certificates git curl \
-    build-essential autoconf automake libtool pkg-config \
-    zlib1g-dev libssl-dev libedit-dev \
-    libpam0g-dev libselinux1-dev libkrb5-dev \
-    >/dev/null
+locate_hpnsshd() {
+  local bin="${PREFIX}/sbin/hpnsshd"
+  [[ -x "$bin" ]] && { echo "$bin"; return 0; }
+  bin="$(find "$PREFIX" -maxdepth 6 -type f -name 'hpnsshd' -perm -111 2>/dev/null | head -n 1 || true)"
+  [[ -n "$bin" && -x "$bin" ]] || die "Could not find installed hpnsshd under $PREFIX"
+  echo "$bin"
 }
 
-clone_build_install(){
-  rm -rf "$WORKDIR/hpn-ssh" >/dev/null 2>&1 || true
-  mkdir -p "$WORKDIR"
-  git clone --depth 1 "$HPN_REPO" "$WORKDIR/hpn-ssh" >/dev/null
-  cd "$WORKDIR/hpn-ssh"
-  autoreconf -fi >/dev/null
-  ./configure --prefix="$PREFIX" --sysconfdir="$SYSCONFDIR" >/dev/null
-  make -j"$MAKE_JOBS" >/dev/null
-  make install >/dev/null
-}
-
-locate_hpnsshd(){
-  local b="$PREFIX/sbin/hpnsshd"
-  [[ -x "$b" ]] && { echo "$b"; return; }
-  b="$(find "$PREFIX" -type f -name hpnsshd -perm -111 2>/dev/null | head -n 1 || true)"
-  [[ -x "$b" ]] || die "hpnsshd not found under $PREFIX"
-  echo "$b"
-}
-
-ensure_privsep(){
+ensure_privsep_user() {
+  _stage "PrivSep"
   if ! id -u hpnsshd >/dev/null 2>&1; then
-    useradd --system --home /var/empty --shell /usr/sbin/nologin --comment 'HPN-SSH PrivSep' hpnsshd
+    bash -lc "useradd --system --home /var/empty --shell /usr/sbin/nologin --comment 'HPN-SSH PrivSep' hpnsshd" >>"$INSLOG" 2>&1
+    ok "Created user: hpnsshd"
+  else
+    ok "User hpnsshd already exists"
   fi
   mkdir -p /var/empty
   chown root:root /var/empty
   chmod 755 /var/empty
+  ok "/var/empty ready"
 }
 
-ensure_hostkeys(){
-  mkdir -p "$SYSCONFDIR"
+ensure_host_keys() {
+  _stage "Host keys"
+  ensure_dir "$SYSCONFDIR"
   if [[ ! -f "$SYSCONFDIR/ssh_host_ed25519_key" ]]; then
-    ssh-keygen -t ed25519 -f "$SYSCONFDIR/ssh_host_ed25519_key" -N "" >/dev/null
-  fi
-  if [[ ! -f "$SYSCONFDIR/ssh_host_rsa_key" ]]; then
-    ssh-keygen -t rsa -b 4096 -f "$SYSCONFDIR/ssh_host_rsa_key" -N "" >/dev/null
+    _run_stage "Keygen" "$INSLOG" \
+      "ssh-keygen -t ed25519 -f '$SYSCONFDIR/ssh_host_ed25519_key' -N '' &&
+       ssh-keygen -t rsa -b 4096 -f '$SYSCONFDIR/ssh_host_rsa_key' -N ''"
+  else
+    ok "Host keys already exist."
   fi
   chmod 700 "$SYSCONFDIR"
   chmod 600 "$SYSCONFDIR"/ssh_host_*_key 2>/dev/null || true
   chmod 644 "$SYSCONFDIR"/ssh_host_*_key.pub 2>/dev/null || true
 }
 
-detect_sftp(){
-  for p in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/openssh/sftp-server; do
-    [[ -x "$p" ]] && { echo "$p"; return; }
-  done
-  echo "/usr/lib/openssh/sftp-server"
-}
-
-# Check if daemon accepts an option (avoid "Bad configuration option")
-supports_opt(){
-  local bin="$1" opt="$2"
-  local tmp hk
-  tmp="$(mktemp)"
-  hk="$SYSCONFDIR/ssh_host_ed25519_key"
-  cat >"$tmp" <<EOF
-Port 0
-ListenAddress 127.0.0.1
-HostKey $hk
-$opt
-EOF
-  "$bin" -t -f "$tmp" >/dev/null 2>&1
-  local rc=$?
-  rm -f "$tmp"
-  return $rc
-}
-
-write_config(){
-  local bin="$1"
+write_config() {
   local cfg="$SYSCONFDIR/hpnsshd_config"
-  local sftp; sftp="$(detect_sftp)"
+  local hpnsshd_bin="${HPNSSHD_BIN:-}"
+  [[ -n "$hpnsshd_bin" && -x "$hpnsshd_bin" ]] || die "Internal error: HPNSSHD_BIN not set before write_config()"
 
-  # We WANT to disable PAM/challenge, but only if option exists.
+  _stage "Config"
+
   local USEPAM_LINE=""
-  local KBD_LINE=""
-  local CHAL_LINE=""
-
-  if supports_opt "$bin" "UsePAM no"; then
-    USEPAM_LINE="UsePAM no"
-  fi
-  if supports_opt "$bin" "KbdInteractiveAuthentication no"; then
-    KBD_LINE="KbdInteractiveAuthentication no"
-  fi
-  if supports_opt "$bin" "ChallengeResponseAuthentication no"; then
-    CHAL_LINE="ChallengeResponseAuthentication no"
+  if supports_option "$hpnsshd_bin" "UsePAM yes"; then
+    USEPAM_LINE="UsePAM yes"
+    ok "UsePAM supported -> enabled"
+  else
+    ok "UsePAM NOT supported -> skipped"
   fi
 
-  cat >"$cfg" <<EOF
-# HPN SSHD (separate instance) - NO PAM / NO CHALLENGE
-Port $PORT
+  local USEDNS_LINE=""
+  if supports_option "$hpnsshd_bin" "UseDNS no"; then
+    USEDNS_LINE="UseDNS ${USE_DNS}"
+    ok "UseDNS supported -> ${USE_DNS}"
+  else
+    ok "UseDNS NOT supported -> skipped"
+  fi
+
+  local SFTP_SERVER
+  SFTP_SERVER="$(detect_sftp_server)"
+  ok "sftp-server -> ${SFTP_SERVER}"
+
+  cat > "$cfg" <<CFGEOF
+# ============================================================
+# HUNTEX HPN-SSH-Tunnel - HPN sshd config (separate instance)
+# ============================================================
+
+Port ${PORT}
 ListenAddress 0.0.0.0
 ListenAddress ::
 
-PidFile /run/$SERVICE/$SERVICE.pid
+PidFile /run/${SERVICE}/${SERVICE}.pid
 
-HostKey $SYSCONFDIR/ssh_host_ed25519_key
-HostKey $SYSCONFDIR/ssh_host_rsa_key
+HostKey ${SYSCONFDIR}/ssh_host_ed25519_key
+HostKey ${SYSCONFDIR}/ssh_host_rsa_key
 
-PermitRootLogin $PERMIT_ROOT_LOGIN
-PasswordAuthentication $PASSWORD_AUTH
+# --- Security
+PermitRootLogin ${PERMIT_ROOT_LOGIN}
+PasswordAuthentication ${PASSWORD_AUTH}
+KbdInteractiveAuthentication ${KBDINT_AUTH}
+${USEPAM_LINE}
+
 PubkeyAuthentication yes
-
-$USEPAM_LINE
-$KBD_LINE
-$CHAL_LINE
-
 AuthorizedKeysFile .ssh/authorized_keys
+
+# reduce post-auth noise (helps weak links)
 PrintMotd no
 PrintLastLog no
 
-UseDNS $USE_DNS
-LoginGraceTime $LOGIN_GRACE_TIME
-MaxAuthTries $MAX_AUTH_TRIES
-LogLevel $LOG_LEVEL
+# --- Reliability
+${USEDNS_LINE}
+LoginGraceTime ${LOGIN_GRACE_TIME}
+MaxAuthTries ${MAX_AUTH_TRIES}
+LogLevel ${LOG_LEVEL}
 
-Ciphers $CIPHERS
+# --- Crypto (compatible + HPN)
+Ciphers ${CIPHERS}
 
+# --- Tunnel / forwarding
 AllowTcpForwarding yes
 GatewayPorts yes
 
+# --- Keepalive
 TCPKeepAlive yes
 ClientAliveInterval 60
 ClientAliveCountMax 3
 
 Compression no
-Subsystem sftp $sftp
-EOF
+Subsystem sftp ${SFTP_SERVER}
+CFGEOF
 
-  ok "Config -> $cfg"
+  ok "Config written -> ${cfg}"
 }
 
-write_unit(){
-  local bin="$1"
+write_systemd_unit() {
+  local hpnsshd_bin="$1"
   local cfg="$SYSCONFDIR/hpnsshd_config"
-  local unit="/etc/systemd/system/$SERVICE.service"
+  local unit="/etc/systemd/system/${SERVICE}.service"
 
-  cat >"$unit" <<EOF
+  _stage "Systemd"
+
+  cat > "$unit" <<UNITEOF
 [Unit]
-Description=HPN-SSHD (no PAM/challenge) on port $PORT
+Description=HPN-SSH server (separate instance on port ${PORT})
 After=network.target
 StartLimitIntervalSec=60
 StartLimitBurst=10
 
 [Service]
 Type=simple
-RuntimeDirectory=$SERVICE
+RuntimeDirectory=${SERVICE}
 RuntimeDirectoryMode=0755
 
-ExecStartPre=$bin -t -f $cfg
-ExecStart=$bin -D -f $cfg -E $RUNTIMELOG
+ExecStartPre=${hpnsshd_bin} -t -f ${cfg}
+ExecStart=${hpnsshd_bin} -D -f ${cfg} -E ${RUNTIMELOG}
+ExecReload=/bin/kill -HUP \$MAINPID
+
 Restart=on-failure
 RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNITEOF
 
-  systemctl daemon-reload
-  ok "Unit -> $unit"
+  _run_stage "daemon-reload" "$SVCLOG" "systemctl daemon-reload"
+  ok "Unit installed -> ${unit}"
 }
 
-start_service(){
-  systemctl stop "$SERVICE.service" >/dev/null 2>&1 || true
-  systemctl disable "$SERVICE.service" >/dev/null 2>&1 || true
-  systemctl reset-failed "$SERVICE.service" >/dev/null 2>&1 || true
+start_service() {
+  _stage "Service"
 
-  systemctl enable --now "$SERVICE.service"
+  _run_stage "reset-failed" "$SVCLOG" "systemctl reset-failed '${SERVICE}.service' || true"
+  _run_stage "enable+start" "$SVCLOG" "systemctl enable --now '${SERVICE}.service'"
 
+  echo
+  ok "Service status (short):"
+  systemctl --no-pager --full status "${SERVICE}.service" | sed -n '1,35p' || true
+echo
   ok "Listening:"
-  ss -lntp | grep -E ":(22|$PORT)\b" || true
-  ok "Status:"
-  systemctl --no-pager --full status "$SERVICE.service" | sed -n '1,35p' || true
+  ss -lntp | grep -E ":(22|${PORT})\b" || true
+
+  echo
+  ok "Last logs (service):"
+  journalctl -u "${SERVICE}.service" --no-pager -n 20 || true
 }
 
-cmd_install(){
-  has systemctl || die "systemd required."
-  ensure_deps
+status_cmd() {
+  banner
+  ok "Ports:"
+  ss -lntp | grep -E ":(22|${PORT})\b" || true
+  echo
+  ok "Service:"
+  systemctl --no-pager --full status "${SERVICE}.service" || true
+}
+
+logs_cmd() {
+  banner
+  ok "Journal (last 200 lines):"
+  journalctl -u "${SERVICE}.service" --no-pager -n 200 || true
+  echo
+  ok "Runtime log: ${RUNTIMELOG}"
+  tail -n 200 "${RUNTIMELOG}" 2>/dev/null || true
+}
+
+uninstall_cmd() {
+  banner
+  warn "Uninstalling ${APP_NAME}..."
+  warn "Removes: service + config + install prefix."
+  warn "Does NOT remove: user 'hpnsshd' and /var/empty (safe)."
+
+  systemctl stop "${SERVICE}.service" 2>/dev/null || true
+  systemctl disable "${SERVICE}.service" 2>/dev/null || true
+  rm -f "/etc/systemd/system/${SERVICE}.service"
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed "${SERVICE}.service" 2>/dev/null || true
+
+  rm -rf "$SYSCONFDIR" || true
+  rm -rf "$PREFIX" || true
+  rm -f "$RUNTIMELOG" || true
+
+  ok "Uninstalled."
+  echo -e "${C_GRAY}Optional cleanup:${C_RESET}"
+  echo -e "  ${C_DIM}sudo userdel hpnsshd 2>/dev/null; sudo rm -rf /var/empty${C_RESET}"
+}
+
+install_cmd() {
+  banner
+  detect_ubuntu
+  has_cmd systemctl || die "systemd is required (systemctl not found)."
+  has_cmd ss || warn "'ss' not found? install iproute2."
+
+  install_deps
   clone_build_install
-  ensure_privsep
-  ensure_hostkeys
-  local bin; bin="$(locate_hpnsshd)"
-  write_config "$bin"
-  write_unit "$bin"
+
+  _stage "Detect daemon"
+  local hpnsshd_bin
+  hpnsshd_bin="$(locate_hpnsshd)"
+  ok "Using daemon: ${hpnsshd_bin}"
+  bash -lc "'${hpnsshd_bin}' -V 2>&1 || true" >>"$INSLOG" 2>&1
+
+  ensure_privsep_user
+  ensure_host_keys
+
+  HPNSSHD_BIN="$hpnsshd_bin"
+  write_config
+  write_systemd_unit "$hpnsshd_bin"
   start_service
+
   echo
-  ok "Test:"
-  echo "ssh -p $PORT root@YOUR_SERVER_IP"
-  echo "Logs: journalctl -u $SERVICE -f  |  tail -f $RUNTIMELOG"
+  hr
+  ok "DONE ✅"
+  echo -e "${C_GRAY}Test:${C_RESET}  ${C_BOLD}ssh -p ${PORT} root@YOUR_SERVER_IP${C_RESET}"
+  echo -e "${C_GRAY}Logs:${C_RESET}  ${C_BOLD}journalctl -u ${SERVICE} -f${C_RESET}  |  ${C_BOLD}tail -f ${RUNTIMELOG}${C_RESET}"
+  hr
 }
 
-cmd_status(){
-  ss -lntp | grep -E ":(22|$PORT)\b" || true
-  systemctl --no-pager --full status "$SERVICE.service" || true
+usage() {
+  banner
+  cat <<USAGE
+Usage:
+  sudo ./${0##*/} install
+  sudo ./${0##*/} status
+  sudo ./${0##*/} logs
+  sudo ./${0##*/} uninstall
+
+Env overrides:
+  PORT=2222 SERVICE=hpnsshd PREFIX=/usr/local/hpnssh SYSCONFDIR=/etc/hpnssh MAKE_JOBS=1
+  PERMIT_ROOT_LOGIN=prohibit-password|yes
+  PASSWORD_AUTH=no|yes
+  KBDINT_AUTH=no|yes
+  USE_DNS=no
+  LOGIN_GRACE_TIME=180
+  MAX_AUTH_TRIES=6
+  LOG_LEVEL=DEBUG2|VERBOSE
+  CIPHERS="..."
+USAGE
 }
 
-cmd_logs(){
-  journalctl -u "$SERVICE.service" --no-pager -n 200 || true
-  echo
-  tail -n 200 "$RUNTIMELOG" 2>/dev/null || true
-}
-
-cmd_uninstall(){
-  systemctl stop "$SERVICE.service" >/dev/null 2>&1 || true
-  systemctl disable "$SERVICE.service" >/dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/$SERVICE.service" || true
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl reset-failed "$SERVICE.service" >/dev/null 2>&1 || true
-  rm -rf "$SYSCONFDIR" "$PREFIX" "$WORKDIR/hpn-ssh" 2>/dev/null || true
-  rm -f "$RUNTIMELOG" 2>/dev/null || true
-  ok "Uninstalled (user hpnsshd kept)."
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    install)   install_cmd ;;
+    status)    status_cmd ;;
+    logs)      logs_cmd ;;
+    uninstall) uninstall_cmd ;;
+    ""|-h|--help|help) usage ;;
+    *) die "Unknown command: $cmd (use: install/status/logs/uninstall)" ;;
+  esac
 }
 
 need_root
-case "${1:-}" in
-  install)   cmd_install ;;
-  status)    cmd_status ;;
-  logs)      cmd_logs ;;
-  uninstall) cmd_uninstall ;;
-  *) echo "Usage: $0 install|status|logs|uninstall"; exit 1 ;;
-esac
+main "$@"
