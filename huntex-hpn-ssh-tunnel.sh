@@ -1,4 +1,3 @@
-cat > huntex-hpn-ssh-tunnel.sh <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
