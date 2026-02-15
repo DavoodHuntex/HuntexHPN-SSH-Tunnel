@@ -267,6 +267,9 @@ write_systemd_unit() {
 [Unit]
 Description=HPN-SSH server (separate instance on port ${PORT})
 After=network.target
+# Avoid aggressive restart loops
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -281,10 +284,6 @@ ExecReload=/bin/kill -HUP \$MAINPID
 
 Restart=on-failure
 RestartSec=2
-
-# Avoid aggressive restart loops
-StartLimitIntervalSec=60
-StartLimitBurst=10
 
 [Install]
 WantedBy=multi-user.target
