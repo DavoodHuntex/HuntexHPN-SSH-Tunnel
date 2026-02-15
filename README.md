@@ -24,7 +24,7 @@ running alongside your system OpenSSH without touching port **22**.
 ### Quick Start
 
 ```bash
-curl -fsSL <RAW_URL_TO_SCRIPT> -o huntex-hpn-ssh-tunnel.sh
+curl -fsSL https://raw.githubusercontent.com/DavoodHuntex/HuntexHPN-SSH-Tunnel/main/huntex-hpn-ssh-tunnel.sh -o huntex-hpn-ssh-tunnel.sh
 chmod +x huntex-hpn-ssh-tunnel.sh
 sudo ./huntex-hpn-ssh-tunnel.sh install
 ```
@@ -92,13 +92,14 @@ This weakens SSH security.
 
 ## 🎛 Environment Overrides
 You may override defaults during installation:
-
+```
 PORT=2222 \
 SERVICE=hpnsshd \
 PREFIX=/usr/local/hpnssh \
 SYSCONFDIR=/etc/hpnssh \
 MAKE_JOBS=1 \
 sudo ./huntex-hpn-ssh-tunnel.sh install
+```
 
 
 ## 🌍 Connectivity Test
