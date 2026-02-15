@@ -11,7 +11,7 @@ set -Eeuo pipefail
 # ============================================================
 
 APP_NAME="HUNTEX-HPN-SSH-Tunnel"
-APP_VER="1.1.0"
+APP_VER="1.1.1"
 
 # -----------------------
 # Defaults (override via env)
@@ -26,23 +26,30 @@ HPN_REPO="${HPN_REPO:-https://github.com/rapier1/hpn-ssh.git}"
 MAKE_JOBS="${MAKE_JOBS:-1}"
 
 # -----------------------
-# Security defaults (YOU asked: password must work)
+# Security defaults (password must work)
 # -----------------------
 PERMIT_ROOT_LOGIN="${PERMIT_ROOT_LOGIN:-yes}"
 PASSWORD_AUTH="${PASSWORD_AUTH:-yes}"
-KBDINT_AUTH="${KBDINT_AUTH:-yes}"
+
+# IMPORTANT: sshpass + Iran links often get stuck on keyboard-interactive prompts
+KBDINT_AUTH="${KBDINT_AUTH:-no}"
 
 # -----------------------
 # Reliability / Iran-tuned (safe defaults)
 # -----------------------
 USE_DNS="${USE_DNS:-no}"
-LOGIN_GRACE_TIME="${LOGIN_GRACE_TIME:-60}"
+
+# IMPORTANT: prevent "Timeout before authentication ... exceeded LoginGraceTime"
+LOGIN_GRACE_TIME="${LOGIN_GRACE_TIME:-180}"
+
 MAX_AUTH_TRIES="${MAX_AUTH_TRIES:-6}"
 LOG_LEVEL="${LOG_LEVEL:-VERBOSE}"  # DEBUG2 if you want more
 
-# Prefer standard OpenSSH cipher set (avoid weird edge cases)
-CIPHERS="${CIPHERS:-chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr}"
-MACS="${MACS:-hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,umac-128-etm@openssh.com,hmac-sha2-256,hmac-sha2-512}"
+# Prefer compatible cipher set (include HPN mt cipher)
+CIPHERS="${CIPHERS:-chacha20-poly1305-mt@hpnssh.org,chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr}"
+
+# IMPORTANT: Do NOT force MACs (breaks negotiation for some clients like libssh2)
+# MACS is intentionally not used in config.
 
 # -----------------------
 # Colors / UI
@@ -100,8 +107,6 @@ RUNTIMELOG="/var/log/${SERVICE}.log"
 
 # -----------------------
 # Stage runner with LIVE progress
-# - shows elapsed, logfile size, and last line (updates in-place)
-# - avoids "working..." (doesn't feel hung)
 # -----------------------
 _stage() {
   echo
@@ -129,7 +134,6 @@ _run_stage() {
   log "CMD -> $cmd"
   echo
 
-  # Run command in background, log everything
   bash -lc "$cmd" >>"$logfile" 2>&1 &
   local pid=$!
 
@@ -138,7 +142,6 @@ _run_stage() {
   local spin='|/-\'
   local i=0
 
-  # Live monitor
   while kill -0 "$pid" >/dev/null 2>&1; do
     now_ts="$(date +%s)"
     elapsed=$(( now_ts - start_ts ))
@@ -155,7 +158,6 @@ _run_stage() {
       last="$(tail -n 1 "$logfile" 2>/dev/null || true)"
     fi
 
-    # keep the line readable
     last="${last//$'\r'/}"
     if (( ${#last} > 110 )); then
       last="…${last: -110}"
@@ -168,11 +170,10 @@ _run_stage() {
     sleep 0.4
   done
 
-  # collect exit code
   wait "$pid"
   local rc=$?
 
-  printf "\r%*s\r" 180 ""  # clear line
+  printf "\r%*s\r" 180 ""
   if (( rc == 0 )); then
     ok "${title} -> OK"
   else
@@ -206,7 +207,6 @@ detect_ubuntu() {
   [[ "${ID:-}" == "ubuntu" ]] || warn "Tested on Ubuntu. Detected: ${ID:-unknown} ${VERSION_ID:-}"
 }
 
-# Pick a hostkey path that EXISTS for option testing (avoids false negatives)
 pick_test_hostkey() {
   local k=""
   for k in \
@@ -216,14 +216,12 @@ pick_test_hostkey() {
     "/etc/ssh/ssh_host_rsa_key"
   do
     if [[ -f "$k" ]]; then
-      echo "$k"
-      return 0
+      echo "$k"; return 0
     fi
   done
   echo "/etc/ssh/ssh_host_ed25519_key"
 }
 
-# Detect whether hpnsshd supports an option (UsePAM / UseDNS ...)
 supports_option() {
   local bin="$1"
   local opt_line="$2"
@@ -377,15 +375,18 @@ ${USEPAM_LINE}
 PubkeyAuthentication yes
 AuthorizedKeysFile .ssh/authorized_keys
 
+# reduce post-auth noise (helps weak links)
+PrintMotd no
+PrintLastLog no
+
 # --- Reliability
 ${USEDNS_LINE}
 LoginGraceTime ${LOGIN_GRACE_TIME}
 MaxAuthTries ${MAX_AUTH_TRIES}
 LogLevel ${LOG_LEVEL}
 
-# --- Crypto
+# --- Crypto (compatible + HPN)
 Ciphers ${CIPHERS}
-MACs ${MACS}
 
 # --- Tunnel / forwarding
 AllowTcpForwarding yes
@@ -541,11 +542,10 @@ Env overrides:
   PASSWORD_AUTH=no|yes
   KBDINT_AUTH=no|yes
   USE_DNS=no
-  LOGIN_GRACE_TIME=60
+  LOGIN_GRACE_TIME=180
   MAX_AUTH_TRIES=6
   LOG_LEVEL=DEBUG2|VERBOSE
   CIPHERS="..."
-  MACS="..."
 USAGE
 }
 
