@@ -13,7 +13,7 @@ set -Eeuo pipefail
 # ============================================================
 
 APP_NAME="HUNTEX-HPN-SSH-Tunnel"
-APP_VER="3.1.1-noerror-real"
+APP_VER="3.1.1"
 
 # -----------------------
 # Defaults (override via env)
