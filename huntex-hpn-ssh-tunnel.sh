@@ -29,15 +29,15 @@ set -Eeuo pipefail
 #    HPN_REPO=https://github.com/rapier1/hpn-ssh.git
 #    MAKE_JOBS=1
 #
-#  Security toggles (recommended defaults are safer):
-#    PERMIT_ROOT_LOGIN=prohibit-password   (or "yes")
-#    PASSWORD_AUTH=no                      (or "yes")
-#    KBDINT_AUTH=no                        (or "yes")
+#  Security toggles:
+#    PERMIT_ROOT_LOGIN=yes|prohibit-password
+#    PASSWORD_AUTH=yes|no
+#    KBDINT_AUTH=yes|no
 #
 # ============================================================
 
 APP_NAME="HuntexHPN-SSH-Tunnel"
-APP_VER="1.0.7"
+APP_VER="1.0.8"
 
 # -----------------------
 # Defaults (override via env)
@@ -51,8 +51,9 @@ LOGDIR="${LOGDIR:-/root/hpn-logs}"
 HPN_REPO="${HPN_REPO:-https://github.com/rapier1/hpn-ssh.git}"
 MAKE_JOBS="${MAKE_JOBS:-1}"
 
-# Security defaults (safe-ish for public servers)
-# Security defaults
+# -----------------------
+# Security defaults (YOU asked: password must work)
+# -----------------------
 PERMIT_ROOT_LOGIN="${PERMIT_ROOT_LOGIN:-yes}"
 PASSWORD_AUTH="${PASSWORD_AUTH:-yes}"
 KBDINT_AUTH="${KBDINT_AUTH:-yes}"
@@ -126,6 +127,26 @@ detect_ubuntu() {
   # shellcheck disable=SC1091
   . /etc/os-release
   [[ "${ID:-}" == "ubuntu" ]] || warn "This script is tested on Ubuntu. Detected: ${ID:-unknown} ${VERSION_ID:-}"
+}
+
+# ============================================================
+# (1/4) NEW: Detect whether hpnsshd supports "UsePAM"
+# ============================================================
+supports_usepam() {
+  # returns 0 if the daemon accepts "UsePAM", otherwise 1
+  local bin="$1"
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<'EOF'
+Port 0
+ListenAddress 127.0.0.1
+HostKey /etc/ssh/ssh_host_ed25519_key
+UsePAM yes
+EOF
+  "$bin" -t -f "$tmp" >/dev/null 2>&1
+  local rc=$?
+  rm -f "$tmp"
+  return $rc
 }
 
 # -----------------------
@@ -209,24 +230,6 @@ ensure_host_keys() {
   chmod 644 "$SYSCONFDIR"/ssh_host_*_key.pub 2>/dev/null || true
 }
 
-# IMPORTANT: we only touch UsePAM here (fixes your error) and keep everything else same.
-supports_usepam() {
-  # returns 0 if the daemon accepts "UsePAM", otherwise 1
-  local bin="$1"
-  local tmp
-  tmp="$(mktemp)"
-  cat >"$tmp" <<'EOF'
-Port 2222
-ListenAddress 127.0.0.1
-HostKey /etc/ssh/ssh_host_ed25519_key
-UsePAM yes
-EOF
-  "$bin" -t -f "$tmp" >/dev/null 2>&1
-  local rc=$?
-  rm -f "$tmp"
-  return $rc
-}
-
 write_config() {
   local cfg="$SYSCONFDIR/hpnsshd_config"
   local hpnsshd_bin="${HPNSSHD_BIN:-}"
@@ -234,28 +237,14 @@ write_config() {
 
   step "Writing config: ${cfg}"
 
-  # ---- Option support detection (low-risk)
-  supports_option() {
-    local opt="$1"
-    local tmp
-    tmp="$(mktemp)"
-    cat >"$tmp" <<EOFCONF
-Port 0
-ListenAddress 127.0.0.1
-HostKey ${SYSCONFDIR}/ssh_host_ed25519_key
-${opt}
-EOFCONF
-    "$hpnsshd_bin" -t -f "$tmp" >/dev/null 2>&1
-    local rc=$?
-    rm -f "$tmp"
-    return $rc
-  }
-
+  # ============================================================
+  # (2/4) NEW: Build a safe UsePAM line only if supported
+  # ============================================================
   local USEPAM_LINE=""
-  if supports_option "UsePAM no"; then
+  if supports_usepam "$hpnsshd_bin"; then
     USEPAM_LINE="UsePAM yes"
   else
-    USEPAM_LINE=""  # HPN build doesn't support UsePAM -> do not write it
+    USEPAM_LINE="" # Unsupported -> do not write it (prevents your error)
   fi
 
   cat > "$cfg" <<CFGEOF
@@ -405,10 +394,12 @@ install_cmd() {
   ensure_privsep_user
   ensure_host_keys
 
-  # Provide the daemon path to write_config() for option detection
+  # ============================================================
+  # (3/4) NEW: provide daemon path before cfg generation
+  # ============================================================
   HPNSSHD_BIN="$hpnsshd_bin"
-  write_config
 
+  write_config
   write_systemd_unit "$hpnsshd_bin"
   start_service
 
@@ -417,7 +408,7 @@ install_cmd() {
   echo -e "${C_GRAY}Connect test from another server:${C_RESET}"
   echo -e "  ${C_BOLD}ssh -p ${PORT} root@YOUR_SERVER_IP${C_RESET}"
   hr
-  echo -e "${C_YELLOW}${C_BOLD}NOTE:${C_RESET} ${C_GRAY}If you set PASSWORD_AUTH=no (default), use SSH keys. Set PASSWORD_AUTH=yes to allow passwords.${C_RESET}"
+  echo -e "${C_YELLOW}${C_BOLD}NOTE:${C_RESET} ${C_GRAY}Defaults are PASSWORD_AUTH=yes (as you requested). After you set keys, you can harden: PASSWORD_AUTH=no PERMIT_ROOT_LOGIN=prohibit-password${C_RESET}"
 }
 
 usage() {
@@ -450,6 +441,11 @@ main() {
   esac
 }
 
-main "$@"
+# ============================================================
+# (4/4) NEW: Ensure we're root (install/uninstall) earlier
+# (Low risk: doesn't change behavior unless not root)
+# ============================================================
+need_root
 
-chmod +x huntex-hpn-ssh-tunnel.sh
+main "$@"
+```0
