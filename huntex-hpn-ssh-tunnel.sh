@@ -374,6 +374,9 @@ PasswordAuthentication ${PASSWORD_AUTH}
 KbdInteractiveAuthentication ${KBDINT_AUTH}
 ${USEPAM_LINE}
 
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+
 # --- Reliability
 ${USEDNS_LINE}
 LoginGraceTime ${LOGIN_GRACE_TIME}
