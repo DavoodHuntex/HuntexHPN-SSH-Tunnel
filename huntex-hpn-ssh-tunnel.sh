@@ -3,7 +3,6 @@ set -Eeuo pipefail
 
 # ============================================================
 #  HUNTEX HPN-SSH-Tunnel
-#  "NO-ERROR" VERSION (validated options only)
 #  - Builds & installs HPN-SSH into: /usr/local/hpnssh
 #  - Runs hpnsshd on PORT (default 2222) as separate systemd service
 #  - Keeps system sshd on port 22 untouched
@@ -358,7 +357,7 @@ write_config() {
     # If it supports UsePAM no, we can add it safely:
     add_if_supported "$hpnsshd_bin" "UsePAM no"
     # Some builds still have this knob:
-    add_if_supported "$hpnsshd_bin" "ChallengeResponseAuthentication yes"
+    add_if_supported "$hpnsshd_bin" "ChallengeResponseAuthentication no"
   )"
 
   misc_block="$(
@@ -366,6 +365,10 @@ write_config() {
     add_if_supported "$hpnsshd_bin" "LoginGraceTime ${LOGIN_GRACE_TIME}"
     add_if_supported "$hpnsshd_bin" "MaxAuthTries ${MAX_AUTH_TRIES}"
     add_if_supported "$hpnsshd_bin" "LogLevel ${LOG_LEVEL}"
+    add_if_supported "$hpnsshd_bin" "MaxStartups 200:30:500"
+    add_if_supported "$hpnsshd_bin" "PerSourceMaxStartups 50"
+    add_if_supported "$hpnsshd_bin" "PerSourceNetBlockSize 32"
+    add_if_supported "$hpnsshd_bin" "PerSourcePenalties no"
   )"
 
   cipher_line="$(add_if_supported "$hpnsshd_bin" "Ciphers ${CIPHERS}" || true)"
@@ -581,3 +584,4 @@ main() {
 
 need_root
 main "$@"
+```0
