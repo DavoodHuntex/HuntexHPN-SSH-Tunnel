@@ -9,52 +9,49 @@ set -euo pipefail
 #   - Optional conntrack enablement for NAT-heavy hosts
 #   - Optional systemd hardening for huntex-autossh-tunnel.service
 #
-# Scenario (typical):
-#   Iran nodes: inbound :443 -> AutoSSH to RU
-#   RU node: WireGuard peers + DNAT to foreign nodes
-#
 # Notes:
-#   - This optimizer improves stability and reduces stalls, but it cannot
-#     "magically" reduce physical latency (ping) beyond network distance.
-#   - Designed to be idempotent and safe to run multiple times.
+#   - Improves stability/throughput; cannot beat physical latency distance.
+#   - Idempotent: safe to run multiple times.
 # ============================================================
 
-# ---------- Colors (Mustard) ----------
-# Mustard-ish: RGB(204,153,0)
-MUSTARD=$'\033[38;2;204;153;0m'
-DIM=$'\033[2m'
-RESET=$'\033[0m'
+# ---------- Colors (Mustard + Silver) ----------
+# Mustard: RGB(204,153,0)   Silver: RGB(192,192,192)
+C_MUSTARD=$'\033[38;2;204;153;0m'
+C_SILVER=$'\033[38;2;192;192;192m'
+C_DIM=$'\033[2m'
+C_BOLD=$'\033[1m'
+C_RESET=$'\033[0m'
 
-log()   { echo -e "${MUSTARD}==>${RESET} $*"; }
-info()  { echo -e "${MUSTARD}${DIM}[*]${RESET} $*"; }
-warn()  { echo -e "${MUSTARD}${DIM}[!]${RESET} $*"; }
+banner() { echo -e "${C_MUSTARD}${C_BOLD}==>${C_RESET} ${C_SILVER}$*${C_RESET}"; }
+step()   { echo -e "${C_SILVER}${C_DIM}[*]${C_RESET} ${C_SILVER}$*${C_RESET}"; }
+ok()     { echo -e "${C_MUSTARD}${C_BOLD}==>${C_RESET} ${C_SILVER}$*${C_RESET}"; }
 
-log "HUNTEX FINAL OPTIMIZER started"
+banner "HUNTEX FINAL OPTIMIZER started"
 
 # ---------- 0) Basics ----------
 export DEBIAN_FRONTEND=noninteractive
-info "Installing minimal dependencies (best-effort)"
+step "Installing minimal dependencies (best-effort)"
 apt-get update -y >/dev/null 2>&1 || true
 apt-get install -y iproute2 iptables kmod >/dev/null 2>&1 || true
 
 # ---------- 1) sysctl tuning (safe for tunnel/WG/NAT) ----------
 CONF="/etc/sysctl.d/99-huntex-optimizer.conf"
 
-info "Writing sysctl tuning -> ${CONF}"
+step "Writing sysctl tuning -> ${CONF}"
 cat > "${CONF}" <<'SYS'
 # =============================
 # HUNTEX FINAL OPTIMIZER
 # =============================
 # Goals:
-#   - Improve throughput and reduce stalls on long/loaded paths (BBR + FQ)
-#   - Keep tunnels stable (keepalive tuning)
-#   - Make NAT/WireGuard routing behave (ip_forward + rp_filter loose mode)
-#   - Increase queue/backlog headroom
-#   - Increase conntrack table size for NAT-heavy workloads (if conntrack is loaded)
+#   - Improve throughput and reduce stalls (BBR + FQ)
+#   - Stabilize tunnels (keepalive tuning)
+#   - NAT/WireGuard routing sanity (ip_forward + rp_filter loose)
+#   - More headroom for bursts (backlogs)
+#   - Larger conntrack table for NAT-heavy workloads (if loaded)
 #
 # Safety:
-#   - Avoids noisy / unsupported keys (no accept_source_route/promote_secondaries)
-#   - Only writes into /etc/sysctl.d (no vendor file changes)
+#   - Avoids noisy/unsupported keys (no accept_source_route/promote_secondaries)
+#   - Writes only into /etc/sysctl.d (no vendor file edits)
 
 # --- Queueing + Congestion Control ---
 net.core.default_qdisc = fq
@@ -91,7 +88,6 @@ net.ipv4.tcp_fastopen = 3
 net.ipv4.ip_forward = 1
 
 # Loose RPF is recommended for asymmetric routing common with WG/NAT.
-# (1=strict may drop legitimate packets; 2=loose is usually correct here)
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 
@@ -99,13 +95,11 @@ net.ipv4.conf.default.rp_filter = 2
 net.netfilter.nf_conntrack_max = 262144
 SYS
 
-info "Applying sysctl (sysctl --system)"
+step "Applying sysctl (sysctl --system)"
 sysctl --system >/dev/null 2>&1 || true
 
-# ---------- 2) Ensure conntrack module (useful on RU; harmless elsewhere) ----------
-# Some minimal cloud images don't load conntrack by default.
-# We load it now and persist module load for future boots.
-info "Ensuring nf_conntrack module is loaded (best-effort)"
+# ---------- 2) Ensure conntrack module ----------
+step "Ensuring nf_conntrack module is loaded (best-effort)"
 modprobe nf_conntrack >/dev/null 2>&1 || true
 mkdir -p /etc/modules-load.d
 echo "nf_conntrack" > /etc/modules-load.d/nf_conntrack.conf
@@ -115,14 +109,10 @@ if sysctl -n net.netfilter.nf_conntrack_max >/dev/null 2>&1; then
   sysctl -w net.netfilter.nf_conntrack_max=262144 >/dev/null 2>&1 || true
 fi
 
-# ---------- 3) systemd hardening for huntex autossh service (if present) ----------
-# Fixes:
-#   - "Too many open files" under high connection churn
-#   - Flappy restart policies / start-limit exhaustion
+# ---------- 3) systemd hardening (if service exists) ----------
 UNIT_NAME="huntex-autossh-tunnel.service"
-
 if systemctl list-unit-files | grep -q "^${UNIT_NAME}"; then
-  log "Tuning ${UNIT_NAME} (NOFILE + restart policy)"
+  banner "Tuning ${UNIT_NAME} (NOFILE + restart policy)"
   mkdir -p "/etc/systemd/system/${UNIT_NAME}.d"
 
   cat > "/etc/systemd/system/${UNIT_NAME}.d/99-huntex.conf" <<'UNIT'
@@ -136,34 +126,34 @@ UNIT
   systemctl daemon-reload
   systemctl restart "${UNIT_NAME}" >/dev/null 2>&1 || true
 else
-  info "${UNIT_NAME} not found (OK on RU or hosts without AutoSSH)"
+  step "${UNIT_NAME} not found (OK on RU or hosts without AutoSSH)"
 fi
 
 # ---------- 4) Summary ----------
-log "SUMMARY"
-echo -e "${MUSTARD}- sysctl file:${RESET} ${CONF}"
-echo -e "${MUSTARD}- bbr:${RESET} $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
-echo -e "${MUSTARD}- qdisc:${RESET} $(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
-echo -e "${MUSTARD}- ip_forward:${RESET} $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '?')"
-echo -e "${MUSTARD}- rp_filter(all):${RESET} $(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo '?')"
+banner "SUMMARY"
+echo -e "${C_SILVER}- sysctl file:${C_RESET} ${CONF}"
+echo -e "${C_SILVER}- bbr:${C_RESET}  $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+echo -e "${C_SILVER}- qdisc:${C_RESET} $(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
+echo -e "${C_SILVER}- ip_forward:${C_RESET} $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '?')"
+echo -e "${C_SILVER}- rp_filter(all):${C_RESET} $(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo '?')"
 
 if lsmod | grep -q '^nf_conntrack'; then
-  echo -e "${MUSTARD}- conntrack loaded:${RESET} YES"
+  echo -e "${C_SILVER}- conntrack loaded:${C_RESET} YES"
 else
-  echo -e "${MUSTARD}- conntrack loaded:${RESET} NO"
+  echo -e "${C_SILVER}- conntrack loaded:${C_RESET} NO"
 fi
 
 if sysctl -n net.netfilter.nf_conntrack_max >/dev/null 2>&1; then
-  echo -e "${MUSTARD}- nf_conntrack_max:${RESET} $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 'N/A')"
+  echo -e "${C_SILVER}- nf_conntrack_max:${C_RESET} $(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 'N/A')"
 else
-  echo -e "${MUSTARD}- nf_conntrack_max:${RESET} N/A (kernel/module not exposing key)"
+  echo -e "${C_SILVER}- nf_conntrack_max:${C_RESET} N/A"
 fi
 
 pid="$(pgrep -xo autossh 2>/dev/null || true)"
-echo -e "${MUSTARD}- autossh PID:${RESET} ${pid:-NONE}"
+echo -e "${C_SILVER}- autossh PID:${C_RESET} ${pid:-NONE}"
 if [ -n "${pid:-}" ] && [ -r "/proc/${pid}/limits" ]; then
-  echo -e "${MUSTARD}- autossh Max open files:${RESET}"
+  echo -e "${C_SILVER}- autossh Max open files:${C_RESET}"
   grep -i "Max open files" "/proc/${pid}/limits" || true
 fi
 
-log "DONE"
+ok "DONE"
