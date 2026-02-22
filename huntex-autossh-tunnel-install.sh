@@ -1,18 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ------------------------------------------------------------
-# HUNTEX AutoSSH Tunnel Installer (GitHub-ready)
-# - Works with: curl ... | MODE=... IP=... bash
-# - Works with: curl ... | bash -s -- MODE=... IP=...
-# - Writes:
-#   /etc/default/huntex-autossh-tunnel
-#   /usr/local/bin/huntex-autossh-run
-#   /usr/local/bin/huntex-set-ip
-#   /etc/systemd/system/huntex-autossh-tunnel.service
-# - Minimal output: ✅ OK or ❌ FAILED + check commands
-# ------------------------------------------------------------
-
 SERVICE="${SERVICE:-huntex-autossh-tunnel}"
 ENV_FILE="/etc/default/${SERVICE}"
 UNIT_FILE="/etc/systemd/system/${SERVICE}.service"
@@ -21,28 +9,27 @@ SETIP_BIN="/usr/local/bin/huntex-set-ip"
 LOGFILE="/var/log/${SERVICE}.log"
 SSH_DIR="/root/.ssh"
 
-# ---------- accept KEY=VAL passed after bash -s -- ----------
 for a in "$@"; do
   [[ "$a" == *=* ]] || continue
-  # shellcheck disable=SC2163
   export "$a"
 done
 
-# ---------- screen reset (Termius-friendly) ----------
-_have_tty(){ [[ -t 1 ]]; }
-_reset_screen(){
-  _have_tty || return 0
-  # do NOT use RIS; Termius sometimes behaves weird. Use clear+scrollback wipe.
-  printf '\033[0m\033[H\033[2J\033[3J' || true
+need_root(){ [[ "${EUID:-0}" -eq 0 ]] || { echo "need root"; exit 10; }; }
+
+tty_clear(){
+  local T="/dev/tty"
+  [[ -w "$T" ]] || return 0
+  printf '\033[0m\033[H\033[2J\033[3J' >"$T" 2>/dev/null || true
 }
 
-# ---------- minimal UI ----------
+banner(){
+  echo "HUNTEX AutoSSH Tunnel"
+  echo "service: ${SERVICE}"
+  echo
+}
+
 say_ok(){  printf "✅ OK\n"; }
 say_fail(){ printf "❌ FAILED\n"; }
-
-need_root(){
-  [[ "${EUID:-0}" -eq 0 ]] || { echo "need root (sudo)"; exit 10; }
-}
 
 validate_mode(){
   MODE="${MODE:-L}"
@@ -52,7 +39,6 @@ validate_mode(){
 install_pkgs(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y >/dev/null 2>&1 || true
-  # iproute2 for ss (optional but recommended)
   apt-get install -y autossh openssh-client ca-certificates coreutils iproute2 >/dev/null 2>&1 || true
   command -v autossh >/dev/null 2>&1 || { echo "autossh missing"; exit 12; }
   command -v ssh >/dev/null 2>&1 || { echo "ssh missing"; exit 13; }
@@ -66,10 +52,8 @@ init_vars(){
   IP="${IP:-46.226.162.4}"
   PORT="${PORT:-2222}"
   USER="${USER:-root}"
-
   LHOST="${LHOST:-0.0.0.0}"
   LPORT="${LPORT:-443}"
-
   RHOST="${RHOST:-127.0.0.1}"
   RPORT="${RPORT:-443}"
 
@@ -113,7 +97,6 @@ set -Eeuo pipefail
 
 ENV_FILE="/etc/default/huntex-autossh-tunnel"
 [[ -f "$ENV_FILE" ]] || { echo "env missing: $ENV_FILE" >&2; exit 20; }
-# shellcheck disable=SC1090
 source "$ENV_FILE"
 
 : "${MODE:=L}"
@@ -137,12 +120,11 @@ rm -f "$KNOWN" || true
 timeout 7 ssh-keyscan -p "$PORT" -H "$IP" > "$KNOWN" 2>/dev/null || true
 chmod 600 "$KNOWN" || true
 
-[[ -f "$KEY" ]] || { echo "Missing KEY: $KEY" >> "$LOGFILE"; exit 21; }
+[[ -f "$KEY" ]] || { echo "Missing KEY: $KEY" >>"$LOGFILE"; exit 21; }
 chmod 600 "$KEY" || true
 
 SSH_OPTS=(
-  -p "$PORT"
-  -i "$KEY"
+  -p "$PORT" -i "$KEY"
   -o BatchMode=yes
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile="$KNOWN"
@@ -160,17 +142,14 @@ SSH_OPTS=(
   -o LogLevel=ERROR
 )
 
-# quick auth check
 if ! timeout 10 ssh "${SSH_OPTS[@]}" "${USER}@${IP}" "echo AUTH_OK" >>"$LOGFILE" 2>&1; then
   echo "Key auth failed" >>"$LOGFILE"
   exit 22
 fi
 
 if [[ "$MODE" == "L" ]]; then
-  # IRAN listens locally; forward to remote target (on MID side)
   FWD=( -L "${LHOST}:${LPORT}:${RHOST}:${RPORT}" )
 else
-  # OUTSIDE listens remotely; forward back to local target
   FWD=( -R "${RHOST}:${RPORT}:${LHOST}:${LPORT}" )
 fi
 
@@ -188,26 +167,21 @@ write_setip(){
 set -Eeuo pipefail
 SERVICE="${SERVICE}"
 ENV_FILE="${ENV_FILE}"
-
 NEW_IP="\${1:-}"
 [[ -n "\$NEW_IP" ]] || { echo "Usage: huntex-set-ip NEW_IP"; exit 1; }
 [[ -f "\$ENV_FILE" ]] || { echo "Env not found: \$ENV_FILE"; exit 2; }
-
 if ! [[ "\$NEW_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]]; then
-  echo "Invalid IP: \$NEW_IP"
-  exit 3
+  echo "Invalid IP: \$NEW_IP"; exit 3
 fi
-
 if grep -q '^IP=' "\$ENV_FILE"; then
   sed -i "s/^IP=.*/IP=\${NEW_IP}/" "\$ENV_FILE"
 else
   echo "IP=\${NEW_IP}" >> "\$ENV_FILE"
 fi
-
 systemctl daemon-reload
 systemctl restart "\${SERVICE}.service"
 sleep 1
-systemctl --no-pager --full status "\${SERVICE}.service" | sed -n '1,25p' || true
+systemctl --no-pager -l status "\${SERVICE}.service" | sed -n '1,35p' || true
 EOF
   chmod +x "$SETIP_BIN"
 }
@@ -235,36 +209,38 @@ WantedBy=multi-user.target
 EOF
 }
 
-verify_minimal(){
-  local start_ts
-  start_ts="$(date +'%Y-%m-%d %H:%M:%S')"
+fail_reason_one_liner(){
+  journalctl -u "${SERVICE}.service" -n 40 --no-pager 2>/dev/null \
+    | grep -E 'Permission denied|Key auth failed|Unbalanced quoting|remote port forwarding failed|ExitOnForwardFailure|Connection timed out|No route to host|refused|FAILED' \
+    | tail -n 1 || true
+}
 
+print_checks(){
+  echo "check: systemctl --no-pager -l status ${SERVICE}.service | sed -n '1,80p'"
+  echo "logs : journalctl -u ${SERVICE}.service -n 120 --no-pager"
+  echo "file : tail -n 120 ${LOGFILE}"
+}
+
+verify_minimal(){
   systemctl daemon-reload
   systemctl enable "${SERVICE}.service" >/dev/null 2>&1 || true
   systemctl restart "${SERVICE}.service" >/dev/null 2>&1 || return 1
-
   sleep 1
+
   systemctl is-active --quiet "${SERVICE}.service" || return 1
 
-  # Optional: if ss exists, ensure listener exists for MODE=L on LPORT
   if command -v ss >/dev/null 2>&1; then
     if [[ "${MODE}" == "L" ]]; then
       ss -lntH "sport = :${LPORT}" | grep -q . || return 1
     fi
   fi
-
   return 0
-}
-
-print_checks(){
-  echo "check: systemctl --no-pager --full status ${SERVICE}.service | sed -n '1,60p'"
-  echo "logs : journalctl -u ${SERVICE}.service -n 120 --no-pager"
-  echo "file : tail -n 120 ${LOGFILE}"
 }
 
 main(){
   need_root
-  _reset_screen
+  tty_clear
+  banner
 
   init_vars
   validate_mode
@@ -282,6 +258,8 @@ main(){
     exit 0
   else
     say_fail
+    r="$(fail_reason_one_liner)"
+    [[ -n "${r:-}" ]] && echo "reason: $r"
     print_checks
     exit 1
   fi
