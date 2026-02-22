@@ -1,25 +1,22 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-for _arg in "$@"; do
-  [[ "$_arg" == *=* ]] || continue
-  export "$_arg"
-done
-
-_have_tty()  { [[ -t 1 ]]; }
+# ------------------- UI (Silver + Mustard) -------------------
+_have_tty() { [[ -t 1 ]]; }
 _have_tput() { command -v tput >/dev/null 2>&1; }
 
 _full_reset_screen() {
-  _have_tty || return 0
-  printf '\e[0m\e[H\e[2J\e[3J' || true
-  if _have_tput; then
-    tput sgr0 >/dev/null 2>&1 || true
-    tput reset >/dev/null 2>&1 || true
-    printf '\e[H\e[2J\e[3J' || true
+  if _have_tty; then
+    if _have_tput; then
+      tput sgr0 >/dev/null 2>&1 || true
+      tput reset >/dev/null 2>&1 || true
+    else
+      printf '\e[0m\e[H\e[2J'
+    fi
+    printf '\e[3J\e[H\e[2J'
   fi
 }
 
-# Set default colors
 if _have_tty && _have_tput; then
   SILVER="$(tput setaf 7)"
   MUSTARD="$(tput setaf 3)"
@@ -30,19 +27,56 @@ else
   SILVER=""; MUSTARD=""; DIM=""; BOLD=""; RESET=""
 fi
 
-# Utility functions
-_hr() { printf "%s\n" "${DIM}${SILVER}────────────────────────────────────────────────────────────${RESET}"; }
+RED="${RED:-${MUSTARD}}"
+GREEN="${GREEN:-${MUSTARD}}"
+YELLOW="${YELLOW:-${MUSTARD}}"
+CYAN="${CYAN:-${SILVER}}"
 
-# Main variables
+_hr() { printf "%s\n" "${DIM}${SILVER}────────────────────────────────────────────────────────────${RESET}"; }
+_pad() { printf '%*s' "$1" ''; }
+
+_box() {
+  local title="${1:-}"
+  local subtitle="${2:-}"
+  local width=58
+  local tpad=$(( width - ${#title} )); (( tpad < 0 )) && tpad=0
+  local spad=$(( width - ${#subtitle} )); (( spad < 0 )) && spad=0
+
+  _hr
+  printf "%s┌──────────────────────────────────────────────────────────┐%s\n" "${DIM}${SILVER}" "${RESET}"
+  printf "%s│%s %s%s%s%s%s│%s\n" \
+    "${DIM}${SILVER}" "${RESET}" \
+    "${BOLD}${MUSTARD}${title}${RESET}" \
+    "$(_pad "$tpad")" \
+    "${DIM}${SILVER}" "${RESET}"
+  printf "%s│%s %s%s%s%s│%s\n" \
+    "${DIM}${SILVER}" "${RESET}" \
+    "${DIM}${SILVER}${subtitle}${RESET}" \
+    "$(_pad "$spad")" \
+    "${DIM}${SILVER}" "${RESET}"
+  printf "%s└──────────────────────────────────────────────────────────┘%s\n" "${DIM}${SILVER}" "${RESET}"
+  _hr
+}
+
+phase() { printf "%s▶%s %s%s%s\n" "${DIM}${SILVER}" "${RESET}" "${BOLD}${MUSTARD}" "$*" "${RESET}"; }
+ok()    { printf "%s✅%s %s\n" "${BOLD}${MUSTARD}" "${RESET}" "$*"; }
+warn()  { printf "%s⚠️ %s%s\n" "${BOLD}${MUSTARD}" "$*" "${RESET}" >&2; }
+die()   { printf "%s❌ %s%s\n" "${BOLD}${MUSTARD}" "$*" "${RESET}" >&2; exit 1; }
+log()   { printf "%s[%s]%s %s\n" "${DIM}${SILVER}" "$(date +'%F %T')" "${RESET}" "$*"; }
+
+need_root(){ [[ "${EUID:-0}" -eq 0 ]] || die "Run as root (sudo)."; }
+
+# ------------------- Variables ---------------------------
 SERVICE="${SERVICE:-huntex-autossh-tunnel}"
 
-MODE="${MODE:-L}"  # Local forward (-L), Reverse forward (-R)
+MODE="${MODE:-L}"
 IP="${IP:-46.226.162.4}"
 PORT="${PORT:-2222}"
 USER="${USER:-root}"
 
 LHOST="${LHOST:-0.0.0.0}"
 LPORT="${LPORT:-443}"
+
 RHOST="${RHOST:-127.0.0.1}"
 RPORT="${RPORT:-443}"
 
@@ -52,12 +86,14 @@ KEY="${KEY:-/root/.ssh/id_ed25519_${NAME}}"
 
 SSH_DIR="/root/.ssh"
 KNOWN="${SSH_DIR}/known_hosts_${SERVICE}"
+
 ENV_FILE="/etc/default/${SERVICE}"
 UNIT_FILE="/etc/systemd/system/${SERVICE}.service"
 SETIP_BIN="/usr/local/bin/huntex-set-ip"
 LOGFILE="/var/log/${SERVICE}.log"
 
-# Validate mode
+# ------------------- Functions ---------------------------
+
 validate_mode(){
   case "${MODE}" in
     L|R) ;;
@@ -65,24 +101,21 @@ validate_mode(){
   esac
 }
 
-# Install necessary packages
 install_pkgs(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y >/dev/null 2>&1 || true
-  apt-get install -y autossh openssh-client ca-certificates coreutils iproute2 >/dev/null 2>&1 || true
+  apt-get install -y autossh openssh-client ca-certificates coreutils >/dev/null 2>&1 || true
 }
 
-# Ensure prerequisites are installed
 ensure_prereqs(){
   command -v autossh >/dev/null 2>&1 || die "autossh not found"
   command -v ssh >/dev/null 2>&1 || die "ssh not found"
   command -v ssh-keyscan >/dev/null 2>&1 || die "ssh-keyscan not found"
   command -v timeout >/dev/null 2>&1 || die "timeout not found"
   command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
-  command -v ss >/dev/null 2>&1 || warn "ss not found (install iproute2)"
+  command -v ss >/dev/null 2>&1 || true
 }
 
-# Ensure SSH key exists and has correct permissions
 ensure_key(){
   mkdir -p "$SSH_DIR"
   chmod 700 "$SSH_DIR" || true
@@ -90,7 +123,6 @@ ensure_key(){
   chmod 600 "$KEY" || true
 }
 
-# Write environment file
 write_env(){
   cat >"$ENV_FILE" <<EOF
 MODE=${MODE}
@@ -107,9 +139,9 @@ KNOWN=${KNOWN}
 LOGFILE=${LOGFILE}
 EOF
   chmod 600 "$ENV_FILE" || true
+  ok "env -> $ENV_FILE"
 }
 
-# Write CLI script for changing IP
 write_setip(){
   cat >"$SETIP_BIN" <<EOF
 #!/usr/bin/env bash
@@ -130,14 +162,14 @@ sed -i "s/^IP=.*/IP=\${NEW_IP}/" "\$ENV_FILE" 2>/dev/null || true
 grep -q '^IP=' "\$ENV_FILE" || echo "IP=\${NEW_IP}" >> "\$ENV_FILE"
 
 systemctl daemon-reload
-systemctl restart "\${SERVICE}.service"
+systemctl restart "\$SERVICE.service"
 sleep 1
-systemctl --no-pager --full status "\${SERVICE}.service" | sed -n '1,22p' || true
+systemctl --no-pager --full status "\$SERVICE.service" | sed -n '1,22p' || true
 EOF
   chmod +x "$SETIP_BIN" || true
+  ok "cli -> $SETIP_BIN"
 }
 
-# Write systemd unit file
 write_unit(){
   local DESC
   if [[ "${MODE}" = "L" ]]; then
@@ -174,9 +206,10 @@ KillSignal=SIGTERM
 [Install]
 WantedBy=multi-user.target
 EOF
+
+  ok "unit -> $UNIT_FILE"
 }
 
-# Check if the service is running and listening
 _is_listening_local(){
   command -v ss >/dev/null 2>&1 || return 1
   ss -lntH "sport = :${LPORT}" | grep -q .
@@ -203,13 +236,12 @@ _fail_minimal(){
   exit 5
 }
 
-# Enable and start service
 enable_start(){
   local START_TS
   START_TS="$(date +'%Y-%m-%d %H:%M:%S')"
 
   systemctl daemon-reload
-  systemctl enable "${SERVICE}.service" >/dev/null 2>&1 || _fail_minimal "${START_TS}"
+  systemctl enable "${SERVICE}.service" >/dev/null 2>&1 || true
 
   systemctl restart "${SERVICE}.service" >/dev/null 2>&1 || _fail_minimal "${START_TS}"
 
@@ -233,7 +265,6 @@ main(){
   printf "%s•%s OUTSIDE:%s %s@%s:%s%s\n" \
     "${DIM}${SILVER}" "${RESET}" "${RESET}" \
     "${SILVER}${USER}${RESET}" "${SILVER}${IP}${RESET}" "${MUSTARD}${PORT}${RESET}" "${RESET}"
-
   if [[ "${MODE}" = "L" ]]; then
     printf "%s•%s MODE:%s %s  %s→%s %s\n" \
       "${DIM}${SILVER}" "${RESET}" "${RESET}" \
