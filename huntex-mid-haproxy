@@ -40,7 +40,6 @@ else
 fi
 
 _hr() { printf "%s\n" "${DIM}${SILVER}────────────────────────────────────────────────────────────${RESET}"; }
-
 _box() {
   local title="$1" subtitle="$2"
   title="${title:-"No Title"}"
@@ -174,7 +173,7 @@ install_pkgs() {
 }
 
 backup_cfg() {
-  mkdir -p "$CFG_BAK_DIR"
+  mkdir -p "$CFG_Bak_DIR"
   if [[ -f "$CFG" ]]; then
     cp -a "$CFG" "$CFG_BAK_DIR/haproxy.cfg.$(date +%s).bak" || true
   fi
