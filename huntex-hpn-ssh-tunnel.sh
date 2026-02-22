@@ -2,17 +2,16 @@
 set -Eeuo pipefail
 
 # ============================================================
-#  HUNTEX HPN-SSH-Tunnel
+#  HUNTEX HPN-SSH-Tunnel (STABLE / LOW-ERROR edition)
 #  - Builds & installs HPN-SSH into: /usr/local/hpnssh
 #  - Runs hpnsshd on PORT (default 2222) as separate systemd service
 #  - Keeps system sshd on port 22 untouched
-#  - NEVER writes unsupported options (e.g. UsePAM on your build)
-#  - Defaults tuned to what ACTUALLY worked for you:
-#      PasswordAuthentication yes + KbdInteractiveAuthentication yes
+#  - Uses PASSWORD + KBDINT auth by default (lowest error)
+#  - Raises limits (MaxStartups/NOFILE/backlog) for many tunnels
 # ============================================================
 
 APP_NAME="HUNTEX-HPN-SSH-Tunnel"
-APP_VER="3.1.1"
+APP_VER="3.2.0-stable"
 
 # -----------------------
 # Defaults (override via env)
@@ -27,21 +26,40 @@ HPN_REPO="${HPN_REPO:-https://github.com/rapier1/hpn-ssh.git}"
 MAKE_JOBS="${MAKE_JOBS:-1}"
 
 # -----------------------
-# Auth defaults (matches your working case)
+# Auth defaults (lowest error)
 # -----------------------
 PERMIT_ROOT_LOGIN="${PERMIT_ROOT_LOGIN:-yes}"
 PASSWORD_AUTH="${PASSWORD_AUTH:-yes}"
-KBDINT_AUTH="${KBDINT_AUTH:-yes}"   # IMPORTANT: this is what made it work for you
+KBDINT_AUTH="${KBDINT_AUTH:-yes}"   # keep this ON (your working case)
 
 # -----------------------
-# Reliability
+# Reliability / Limits (raised)
 # -----------------------
 USE_DNS="${USE_DNS:-no}"
-LOGIN_GRACE_TIME="${LOGIN_GRACE_TIME:-120}"
-MAX_AUTH_TRIES="${MAX_AUTH_TRIES:-10}"
-LOG_LEVEL="${LOG_LEVEL:-VERBOSE}"
+LOGIN_GRACE_TIME="${LOGIN_GRACE_TIME:-300}"
+MAX_AUTH_TRIES="${MAX_AUTH_TRIES:-50}"
+LOG_LEVEL="${LOG_LEVEL:-ERROR}"
 
-# HPN + compatible ciphers (ONLY applied if daemon accepts it)
+# IMPORTANT: reduce annoying drops during reconnect storms
+# (values are big on purpose)
+MAX_STARTUPS="${MAX_STARTUPS:-2000:30:8000}"
+PER_SOURCE_MAX_STARTUPS="${PER_SOURCE_MAX_STARTUPS:-500}"
+PER_SOURCE_NETBLOCK_SIZE="${PER_SOURCE_NETBLOCK_SIZE:-32}"
+PER_SOURCE_PENALTIES="${PER_SOURCE_PENALTIES:-no}"
+
+# Keepalive (balanced)
+CLIENT_ALIVE_INTERVAL="${CLIENT_ALIVE_INTERVAL:-30}"
+CLIENT_ALIVE_COUNTMAX="${CLIENT_ALIVE_COUNTMAX:-6}"
+
+# systemd limits
+LIMIT_NOFILE="${LIMIT_NOFILE:-1048576}"
+TASKS_MAX="${TASKS_MAX:-infinity}"
+
+# Optional: disable fail2ban/hosts.deny interference (security not important)
+DISABLE_FAIL2BAN="${DISABLE_FAIL2BAN:-1}"
+DISABLE_HOSTS_DENY="${DISABLE_HOSTS_DENY:-1}"
+
+# HPN + compatible ciphers (applied only if daemon accepts it)
 CIPHERS_DEFAULT="chacha20-poly1305-mt@hpnssh.org,chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr"
 CIPHERS="${CIPHERS:-$CIPHERS_DEFAULT}"
 
@@ -81,7 +99,7 @@ banner() {
 ██║  ██║╚██████╔╝██║ ╚████║   ██║   ███████╗██╔╝ ██╗
 ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
 BANNER
-  echo -e "${C_RESET}${C_GRAY}HPN-SSH-Tunnel${C_RESET}\n"
+  echo -e "${C_RESET}${C_GRAY}HPN-SSH-Tunnel (stable/low-error)${C_RESET}\n"
   echo -e "${C_GRAY}${APP_NAME} v${APP_VER} | Port: ${PORT} | Service: ${SERVICE}${C_RESET}"
   hr
 }
@@ -195,30 +213,53 @@ detect_sftp_server() {
   echo "/usr/lib/openssh/sftp-server"
 }
 
-# best-effort: avoid ban/deny surprises
-fix_fail2ban_hostsdeny_best_effort() {
-  _stage "Best-effort: fail2ban/hosts.deny"
-  if systemctl is-active --quiet fail2ban 2>/dev/null; then
-    warn "fail2ban active -> writing ignore rule for ${SERVICE} (best-effort)"
-    mkdir -p /etc/fail2ban/jail.d/ || true
-    cat > "/etc/fail2ban/jail.d/${SERVICE}.local" <<EOF
-[${SERVICE}]
-enabled = false
-port = ${PORT}
+apply_sysctl_tuning() {
+  _stage "Kernel tuning (safe, for many tunnels)"
+  local f="/etc/sysctl.d/99-huntex-hpnsshd.conf"
+  cat >"$f" <<'EOF'
+# Huntex HPNSSHD safe TCP tuning (helps bursts / backlog)
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 10240 65535
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+
+# Keepalive (safe)
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
 EOF
-    systemctl reload fail2ban 2>/dev/null || true
-    ok "fail2ban ignore rule written (best-effort)"
+  sysctl --system >/dev/null 2>&1 || true
+  ok "sysctl applied -> $f"
+}
+
+disable_fail2ban_hostsdeny_best_effort() {
+  _stage "Best-effort: disable fail2ban/hosts.deny interference"
+  if (( DISABLE_FAIL2BAN == 1 )); then
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+      warn "fail2ban active -> stopping+disabling (security not important)"
+      systemctl stop fail2ban 2>/dev/null || true
+      systemctl disable fail2ban 2>/dev/null || true
+      ok "fail2ban disabled"
+    else
+      ok "fail2ban not active"
+    fi
   else
-    ok "fail2ban not active"
+    ok "DISABLE_FAIL2BAN=0 (skipped)"
   fi
 
-  if [[ -f /etc/hosts.deny ]] && grep -qE '(^|\s)sshd(:|\s)' /etc/hosts.deny 2>/dev/null; then
-    warn "hosts.deny has sshd rules -> commenting (best-effort)"
-    cp /etc/hosts.deny /etc/hosts.deny.bak 2>/dev/null || true
-    sed -i 's/^\(.*sshd.*\)$/# \1 # disabled by HPN-SSH/g' /etc/hosts.deny 2>/dev/null || true
-    ok "hosts.deny updated (best-effort)"
+  if (( DISABLE_HOSTS_DENY == 1 )); then
+    if [[ -f /etc/hosts.deny ]] && grep -qE '(^|\s)sshd(:|\s)' /etc/hosts.deny 2>/dev/null; then
+      warn "hosts.deny has sshd rules -> commenting (best-effort)"
+      cp /etc/hosts.deny /etc/hosts.deny.bak 2>/dev/null || true
+      sed -i 's/^\(.*sshd.*\)$/# \1 # disabled by HPN-SSH/g' /etc/hosts.deny 2>/dev/null || true
+      ok "hosts.deny updated"
+    else
+      ok "hosts.deny ok / not present"
+    fi
   else
-    ok "hosts.deny ok / not present"
+    ok "DISABLE_HOSTS_DENY=0 (skipped)"
   fi
 }
 
@@ -232,7 +273,7 @@ install_deps() {
        build-essential pkg-config \
        autoconf automake libtool \
        zlib1g-dev libssl-dev libpam0g-dev libselinux1-dev libedit-dev \
-       libkrb5-dev libcap-ng-dev"
+       libkrb5-dev libcap-ng-dev iproute2 procps"
 }
 
 clone_build_install() {
@@ -295,7 +336,7 @@ ensure_host_keys() {
 }
 
 # -----------------------
-# Option probing (prevents "Unsupported option UsePAM" etc.)
+# Option probing (prevents "Unsupported option ..." errors)
 # -----------------------
 pick_test_hostkey() {
   local k=""
@@ -347,16 +388,12 @@ write_config() {
   local SFTP_SERVER; SFTP_SERVER="$(detect_sftp_server)"
   ok "sftp-server -> ${SFTP_SERVER}"
 
-  # Build validated blocks
   local auth_block misc_block cipher_line
   auth_block="$(
     add_if_supported "$hpnsshd_bin" "PermitRootLogin ${PERMIT_ROOT_LOGIN}"
     add_if_supported "$hpnsshd_bin" "PasswordAuthentication ${PASSWORD_AUTH}"
     add_if_supported "$hpnsshd_bin" "KbdInteractiveAuthentication ${KBDINT_AUTH}"
-    # DO NOT force UsePAM here; your build often does NOT support it.
-    # If it supports UsePAM no, we can add it safely:
     add_if_supported "$hpnsshd_bin" "UsePAM no"
-    # Some builds still have this knob:
     add_if_supported "$hpnsshd_bin" "ChallengeResponseAuthentication no"
   )"
 
@@ -365,17 +402,19 @@ write_config() {
     add_if_supported "$hpnsshd_bin" "LoginGraceTime ${LOGIN_GRACE_TIME}"
     add_if_supported "$hpnsshd_bin" "MaxAuthTries ${MAX_AUTH_TRIES}"
     add_if_supported "$hpnsshd_bin" "LogLevel ${LOG_LEVEL}"
-    add_if_supported "$hpnsshd_bin" "MaxStartups 200:30:500"
-    add_if_supported "$hpnsshd_bin" "PerSourceMaxStartups 50"
-    add_if_supported "$hpnsshd_bin" "PerSourceNetBlockSize 32"
-    add_if_supported "$hpnsshd_bin" "PerSourcePenalties no"
+
+    # BIG limits for many autossh reconnect storms:
+    add_if_supported "$hpnsshd_bin" "MaxStartups ${MAX_STARTUPS}"
+    add_if_supported "$hpnsshd_bin" "PerSourceMaxStartups ${PER_SOURCE_MAX_STARTUPS}"
+    add_if_supported "$hpnsshd_bin" "PerSourceNetBlockSize ${PER_SOURCE_NETBLOCK_SIZE}"
+    add_if_supported "$hpnsshd_bin" "PerSourcePenalties ${PER_SOURCE_PENALTIES}"
   )"
 
   cipher_line="$(add_if_supported "$hpnsshd_bin" "Ciphers ${CIPHERS}" || true)"
 
   cat > "$cfg" <<EOF
 # ============================================================
-# HUNTEX HPN-SSH-Tunnel - NO-ERROR CONFIG (validated)
+# HUNTEX HPN-SSH-Tunnel - STABLE / LOW-ERROR CONFIG (validated)
 # ============================================================
 
 Port ${PORT}
@@ -402,8 +441,8 @@ ${cipher_line}
 
 # --- Keepalive
 TCPKeepAlive yes
-ClientAliveInterval 30
-ClientAliveCountMax 6
+ClientAliveInterval ${CLIENT_ALIVE_INTERVAL}
+ClientAliveCountMax ${CLIENT_ALIVE_COUNTMAX}
 
 Compression no
 AllowTcpForwarding yes
@@ -425,14 +464,14 @@ write_systemd_unit() {
   local hpnsshd_bin="$1"
   local cfg="$SYSCONFDIR/hpnsshd_config"
   local unit="/etc/systemd/system/${SERVICE}.service"
+  local ovr_dir="/etc/systemd/system/${SERVICE}.service.d"
+  local ovr="${ovr_dir}/override.conf"
 
   _stage "Systemd"
   cat > "$unit" <<EOF
 [Unit]
 Description=HPN-SSH server (separate instance on port ${PORT})
 After=network.target
-StartLimitIntervalSec=60
-StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -443,15 +482,24 @@ ExecStartPre=${hpnsshd_bin} -t -f ${cfg}
 ExecStart=${hpnsshd_bin} -D -f ${cfg} -E ${RUNTIMELOG}
 ExecReload=/bin/kill -HUP \$MAINPID
 
-Restart=on-failure
-RestartSec=2
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+  # limits override (NOFILE high, TasksMax infinity)
+  mkdir -p "$ovr_dir"
+  cat >"$ovr" <<EOF
+[Service]
+LimitNOFILE=${LIMIT_NOFILE}
+TasksMax=${TASKS_MAX}
+EOF
+
   _run_stage "daemon-reload" "$SVCLOG" "systemctl daemon-reload"
   ok "Unit installed -> ${unit}"
+  ok "Override -> ${ovr} (LimitNOFILE=${LIMIT_NOFILE}, TasksMax=${TASKS_MAX})"
 }
 
 cleanup_existing_unit() {
@@ -473,7 +521,7 @@ start_service() {
 
   echo
   ok "Last logs:"
-  journalctl -u "${SERVICE}.service" --no-pager -n 30 || true
+  journalctl -u "${SERVICE}.service" --no-pager -n 40 || true
 }
 
 status_cmd() {
@@ -483,12 +531,15 @@ status_cmd() {
   echo
   ok "Service:"
   systemctl --no-pager --full status "${SERVICE}.service" || true
+  echo
+  ok "Limits:"
+  systemctl show "${SERVICE}.service" -p LimitNOFILE -p TasksMax || true
 }
 
 logs_cmd() {
   banner
-  ok "Journal (last 200 lines):"
-  journalctl -u "${SERVICE}.service" --no-pager -n 200 || true
+  ok "Journal (last 250 lines):"
+  journalctl -u "${SERVICE}.service" --no-pager -n 250 || true
   echo
   ok "Runtime log: ${RUNTIMELOG}"
   tail -n 200 "${RUNTIMELOG}" 2>/dev/null || true
@@ -499,11 +550,14 @@ uninstall_cmd() {
   warn "Uninstalling ${APP_NAME}..."
   cleanup_existing_unit
   rm -f "/etc/systemd/system/${SERVICE}.service" 2>/dev/null || true
+  rm -rf "/etc/systemd/system/${SERVICE}.service.d" 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
 
   rm -rf "$SYSCONFDIR" 2>/dev/null || true
   rm -rf "$PREFIX" 2>/dev/null || true
   rm -f "$RUNTIMELOG" 2>/dev/null || true
+  rm -f /etc/sysctl.d/99-huntex-hpnsshd.conf 2>/dev/null || true
+  sysctl --system >/dev/null 2>&1 || true
 
   ok "Uninstalled."
   echo -e "${C_GRAY}Optional cleanup:${C_RESET}"
@@ -516,7 +570,8 @@ install_cmd() {
   has_cmd systemctl || die "systemd is required (systemctl not found)."
   has_cmd ss || warn "'ss' not found? install iproute2."
 
-  fix_fail2ban_hostsdeny_best_effort
+  disable_fail2ban_hostsdeny_best_effort
+  apply_sysctl_tuning
 
   install_deps
   clone_build_install
@@ -538,13 +593,16 @@ install_cmd() {
   echo
   hr
   ok "DONE ✅ (${APP_VER})"
-  ok "This config matches your working behavior:"
+  ok "Low-error behavior enabled:"
   ok "  - PasswordAuthentication yes"
-  ok "  - KbdInteractiveAuthentication yes (default)"
-  ok "  - Unsupported options are never written (e.g. UsePAM on your build)"
+  ok "  - KbdInteractiveAuthentication yes"
+  ok "  - High MaxStartups / PerSourceMaxStartups / LoginGraceTime"
+  ok "  - LimitNOFILE=${LIMIT_NOFILE}"
   echo
-  echo -e "${C_GRAY}Working test command (same as your success):${C_RESET}"
-  echo -e "  ${C_BOLD}sshpass -p 'PASS' ssh -p ${PORT} root@SERVER_IP \\\\\\n    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \\\\\\n    -o PreferredAuthentications=password -o PubkeyAuthentication=no \\\\\\n    -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes${C_RESET}"
+  echo -e "${C_GRAY}Useful:${C_RESET}"
+  echo -e "  ${C_DIM}systemctl status ${SERVICE} --no-pager -l${C_RESET}"
+  echo -e "  ${C_DIM}journalctl -u ${SERVICE} -n 200 --no-pager${C_RESET}"
+  echo -e "  ${C_DIM}tail -n 200 ${RUNTIMELOG}${C_RESET}"
   hr
 }
 
@@ -557,16 +615,13 @@ Usage:
   sudo ./${0##*/} logs
   sudo ./${0##*/} uninstall
 
-Env overrides:
+Env overrides (main):
   PORT=2222 SERVICE=hpnsshd PREFIX=/usr/local/hpnssh SYSCONFDIR=/etc/hpnssh MAKE_JOBS=1
-  PERMIT_ROOT_LOGIN=yes|prohibit-password
-  PASSWORD_AUTH=yes|no
-  KBDINT_AUTH=yes|no
-  USE_DNS=no|yes
-  LOGIN_GRACE_TIME=120
-  MAX_AUTH_TRIES=10
-  LOG_LEVEL=VERBOSE|DEBUG2
-  CIPHERS="..."
+  PASSWORD_AUTH=yes KBDINT_AUTH=yes PERMIT_ROOT_LOGIN=yes
+  LOGIN_GRACE_TIME=300 MAX_AUTH_TRIES=50 LOG_LEVEL=ERROR
+  MAX_STARTUPS="2000:30:8000" PER_SOURCE_MAX_STARTUPS=500
+  LIMIT_NOFILE=1048576 TASKS_MAX=infinity
+  DISABLE_FAIL2BAN=1 DISABLE_HOSTS_DENY=1
 USAGE
 }
 
@@ -584,5 +639,3 @@ main() {
 
 need_root
 main "$@"
-
-
