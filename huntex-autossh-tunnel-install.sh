@@ -1,30 +1,22 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ============================================================
-# HUNTEX Turbo AutoSSH Tunnel (MINIMAL+)
-# - Iran server runs autossh client
-# - Connects to OUTSIDE HPN-SSH: IP:PORT (default 2222)
-# - MODE=L (default): local forward  (-L)  => IRAN listens, forwards to OUTSIDE target
-# - MODE=R           : reverse forward (-R) => OUTSIDE listens, forwards to IRAN target
-# - Uses key: /root/.ssh/id_ed25519_iran-$(hostname -s)
-# - systemd service + env file + CLI huntex-set-ip
-# - Fixes: old-log spam + unit escape errors + ensures restart applies new mode
-# ============================================================
+for _arg in "$@"; do
+  [[ "$_arg" == *=* ]] || continue
+  # shellcheck disable=SC2163
+  export "$_arg"
+done
 
-# -------------------- UI (Silver + Mustard) --------------------
 _have_tty()  { [[ -t 1 ]]; }
 _have_tput() { command -v tput >/dev/null 2>&1; }
 
 _full_reset_screen() {
-  if _have_tty; then
-    if _have_tput; then
-      tput sgr0 >/dev/null 2>&1 || true
-      tput reset >/dev/null 2>&1 || true
-    else
-      printf '\e[0m\e[H\e[2J'
-    fi
-    printf '\e[3J\e[H\e[2J'
+  _have_tty || return 0
+  printf '\e[0m\e[H\e[2J\e[3J' || true
+  if _have_tput; then
+    tput sgr0 >/dev/null 2>&1 || true
+    tput reset >/dev/null 2>&1 || true
+    printf '\e[H\e[2J\e[3J' || true
   fi
 }
 
@@ -47,14 +39,11 @@ _hr() { printf "%s\n" "${DIM}${SILVER}──────────────
 _pad() { printf '%*s' "$1" ''; }
 
 _box() {
-  local title="${1:-No Title}"
-  local subtitle="${2:-No Subtitle}"
+  local title="${1:-}"
+  local subtitle="${2:-}"
   local width=58
-
-  local tpad=$(( width - ${#title} ))
-  local spad=$(( width - ${#subtitle} ))
-  (( tpad < 0 )) && tpad=0
-  (( spad < 0 )) && spad=0
+  local tpad=$(( width - ${#title} )); (( tpad < 0 )) && tpad=0
+  local spad=$(( width - ${#subtitle} )); (( spad < 0 )) && spad=0
 
   _hr
   printf "%s┌──────────────────────────────────────────────────────────┐%s\n" "${DIM}${SILVER}" "${RESET}"
@@ -76,15 +65,12 @@ phase() { printf "%s▶%s %s%s%s\n" "${DIM}${SILVER}" "${RESET}" "${BOLD}${MUSTA
 ok()    { printf "%s✅%s %s\n" "${BOLD}${MUSTARD}" "${RESET}" "$*"; }
 warn()  { printf "%s⚠️ %s%s\n" "${BOLD}${MUSTARD}" "$*" "${RESET}" >&2; }
 die()   { printf "%s❌ %s%s\n" "${BOLD}${MUSTARD}" "$*" "${RESET}" >&2; exit 1; }
-log()   { printf "%s[%s] %s%s\n" "${DIM}${SILVER}" "$(date +'%F %T')" "${RESET}" "$*"; }
 
 need_root(){ [[ "${EUID:-0}" -eq 0 ]] || die "Run as root (sudo)."; }
 
-# -------------------- Original Script --------------------
 SERVICE="${SERVICE:-huntex-autossh-tunnel}"
 
-MODE="${MODE:-L}"   # L=local forward (-L), R=reverse forward (-R)
-
+MODE="${MODE:-L}"
 IP="${IP:-46.226.162.4}"
 PORT="${PORT:-2222}"
 USER="${USER:-root}"
@@ -95,7 +81,7 @@ LPORT="${LPORT:-443}"
 RHOST="${RHOST:-127.0.0.1}"
 RPORT="${RPORT:-443}"
 
-HNAME="$(hostname -s 2>/dev/null || hostname || echo unknown)"
+HNAME="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
 NAME="${NAME:-iran-${HNAME}}"
 KEY="${KEY:-/root/.ssh/id_ed25519_${NAME}}"
 
@@ -121,24 +107,23 @@ install_pkgs(){
 }
 
 ensure_prereqs(){
-  command -v autossh >/dev/null 2>&1 || die "autossh not found (apt install failed?)"
-  command -v ssh >/dev/null 2>&1 || die "ssh not found (openssh-client missing?)"
-  command -v ssh-keyscan >/dev/null 2>&1 || die "ssh-keyscan missing (openssh-client broken?)"
-  command -v timeout >/dev/null 2>&1 || die "timeout missing (coreutils missing?)"
-  command -v systemctl >/dev/null 2>&1 || die "systemd required (systemctl not found)"
-  command -v ss >/dev/null 2>&1 || warn "ss not found (install iproute2) — some checks will be skipped."
+  command -v autossh >/dev/null 2>&1 || die "autossh not found"
+  command -v ssh >/dev/null 2>&1 || die "ssh not found"
+  command -v ssh-keyscan >/dev/null 2>&1 || die "ssh-keyscan not found"
+  command -v timeout >/dev/null 2>&1 || die "timeout not found"
+  command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
+  command -v ss >/dev/null 2>&1 || true
 }
 
 ensure_key(){
   mkdir -p "$SSH_DIR"
   chmod 700 "$SSH_DIR" || true
-  [[ -f "$KEY" ]] || die "SSH key not found: $KEY (run key-setup first so this key exists + is authorized on OUTSIDE)"
+  [[ -f "$KEY" ]] || die "SSH key not found: $KEY"
   chmod 600 "$KEY" || true
 }
 
 write_env(){
   cat >"$ENV_FILE" <<EOF
-# HUNTEX AutoSSH env for ${SERVICE}
 MODE=${MODE}
 IP=${IP}
 PORT=${PORT}
@@ -160,80 +145,25 @@ write_setip(){
   cat >"$SETIP_BIN" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
 SERVICE="${SERVICE}"
 ENV_FILE="${ENV_FILE}"
 
 NEW_IP="\${1:-}"
-if [[ -z "\$NEW_IP" ]]; then
-  echo "Usage: huntex-set-ip NEW_IP"
-  exit 1
-fi
-
-[[ -f "\$ENV_FILE" ]] || { echo "❌ Env file not found: \$ENV_FILE"; exit 2; }
+[[ -n "\$NEW_IP" ]] || { echo "Usage: huntex-set-ip NEW_IP"; exit 1; }
+[[ -f "\$ENV_FILE" ]] || { echo "❌ Env not found: \$ENV_FILE"; exit 2; }
 
 if ! [[ "\$NEW_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]]; then
-  echo "❌ Invalid IP format: \$NEW_IP"
+  echo "❌ Invalid IP: \$NEW_IP"
   exit 3
 fi
 
-START_TS="\$(date +'%Y-%m-%d %H:%M:%S')"
+sed -i "s/^IP=.*/IP=\${NEW_IP}/" "\$ENV_FILE" 2>/dev/null || true
+grep -q '^IP=' "\$ENV_FILE" || echo "IP=\${NEW_IP}" >> "\$ENV_FILE"
 
-echo "→ Updating IP to: \$NEW_IP"
-if grep -q '^IP=' "\$ENV_FILE"; then
-  sed -i "s/^IP=.*/IP=\${NEW_IP}/" "\$ENV_FILE"
-else
-  echo "IP=\${NEW_IP}" >> "\$ENV_FILE"
-fi
-
-echo "→ Restarting \${SERVICE}.service ..."
 systemctl daemon-reload
 systemctl restart "\${SERVICE}.service"
 sleep 1
-
-echo
-systemctl --no-pager --full status "\${SERVICE}.service" | sed -n '1,28p' || true
-
-MODE="\$(grep -E '^MODE=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-LPORT="\$(grep -E '^LPORT=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-RPORT="\$(grep -E '^RPORT=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-USER="\$(grep -E '^USER=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-IP="\$(grep -E '^IP=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-PORT="\$(grep -E '^PORT=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-KEY="\$(grep -E '^KEY=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-KNOWN="\$(grep -E '^KNOWN=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-
-echo
-if [[ "\${MODE:-L}" = "L" ]]; then
-  if command -v ss >/dev/null 2>&1 && ss -lntH "sport = :\${LPORT}" | grep -q .; then
-    echo "✅ Tunnel is listening locally on \${LHOST}:\${LPORT}"
-  else
-    echo "❌ Tunnel not listening locally on \${LHOST}:\${LPORT}"
-    journalctl -u "\${SERVICE}.service" -b --since "\${START_TS}" -n 200 --no-pager || true
-    exit 4
-  fi
-else
-  for i in 1 2 3 4 5; do
-    if timeout 10 ssh -p "\${PORT}" -i "\${KEY}" "\${USER}@\${IP}" \
-      -o BatchMode=yes \
-      -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile="\${KNOWN}" \
-      -o PreferredAuthentications=publickey \
-      -o PubkeyAuthentication=yes \
-      -o PasswordAuthentication=no \
-      -o KbdInteractiveAuthentication=no \
-      -o IdentitiesOnly=yes \
-      "command -v ss >/dev/null 2>&1 && ss -lntH \\"sport = :\${RPORT}\\" | grep -q LISTEN" >/dev/null 2>&1; then
-      echo "✅ Tunnel is listening on remote OUTSIDE port \${RPORT}"
-      exit 0
-    fi
-    sleep 2
-  done
-
-  echo "❌ Tunnel not listening on remote OUTSIDE port \${RPORT}"
-  journalctl -u "\${SERVICE}.service" -b --since "\${START_TS}" -n 200 --no-pager || true
-  exit 4
-fi
+systemctl --no-pager --full status "\${SERVICE}.service" | sed -n '1,22p' || true
 EOF
   chmod +x "$SETIP_BIN" || true
   ok "cli -> $SETIP_BIN"
@@ -249,11 +179,9 @@ write_unit(){
 
   cat >"$UNIT_FILE" <<EOF
 [Unit]
-Description=HUNTEX Turbo AutoSSH Tunnel (MODE=${MODE} | ${DESC} via ${USER}@${IP}:${PORT})
+Description=HUNTEX Turbo AutoSSH Tunnel (MODE=\${MODE} | ${DESC} via \${USER}@\${IP}:\${PORT})
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=0
-StartLimitBurst=0
 
 [Service]
 Type=simple
@@ -261,52 +189,13 @@ User=root
 EnvironmentFile=${ENV_FILE}
 
 Environment=AUTOSSH_GATETIME=0
-Environment=AUTOSSH_POLL=10
-Environment=AUTOSSH_FIRST_POLL=5
-Environment=AUTOSSH_LOGLEVEL=0
 
-ExecStartPre=/bin/bash -lc 'mkdir -p /root/.ssh; chmod 700 /root/.ssh; : > "${LOGFILE}"; chmod 600 "${LOGFILE}" || true'
-ExecStartPre=/bin/bash -lc 'if [[ "${MODE}" = "L" ]] && command -v ss >/dev/null 2>&1; then ss -lntH "sport = :${LPORT}" | grep -q . && { echo "Port ${LPORT} already in use" >> "${LOGFILE}"; exit 1; } || true; fi'
-ExecStartPre=/bin/bash -lc 'timeout 5 bash -lc "cat </dev/null >/dev/tcp/${IP}/${PORT}" >/dev/null 2>&1 || { echo "TCP ${IP}:${PORT} unreachable" >> "${LOGFILE}"; exit 2; }'
-ExecStartPre=/bin/bash -lc 'rm -f "${KNOWN}" || true; timeout 7 ssh-keyscan -p "${PORT}" -H "${IP}" > "${KNOWN}" 2>/dev/null || true; chmod 600 "${KNOWN}" || true'
-ExecStartPre=/bin/bash -lc '[[ -f "${KEY}" ]] || { echo "Missing KEY: ${KEY}" >> "${LOGFILE}"; exit 3; }; chmod 600 "${KEY}" || true'
-ExecStartPre=/bin/bash -lc 'timeout 12 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
--o BatchMode=yes \
--o StrictHostKeyChecking=no \
--o UserKnownHostsFile="${KNOWN}" \
--o PreferredAuthentications=publickey \
--o PubkeyAuthentication=yes \
--o PasswordAuthentication=no \
--o KbdInteractiveAuthentication=no \
--o IdentitiesOnly=yes \
--o ExitOnForwardFailure=yes \
--o ConnectTimeout=7 \
--o ConnectionAttempts=1 \
-"echo AUTH_OK" >> "${LOGFILE}" 2>&1 || { echo "Key auth failed" >> "${LOGFILE}"; tail -n 80 "${LOGFILE}" || true; exit 4; }'
+ExecStartPre=/bin/bash -lc 'mkdir -p /root/.ssh; chmod 700 /root/.ssh; : > "\${LOGFILE}"; chmod 600 "\${LOGFILE}" || true'
+ExecStartPre=/bin/bash -lc 'rm -f "\${KNOWN}" || true; timeout 7 ssh-keyscan -p "\${PORT}" -H "\${IP}" > "\${KNOWN}" 2>/dev/null || true; chmod 600 "\${KNOWN}" || true'
+ExecStartPre=/bin/bash -lc '[[ -f "\${KEY}" ]] || { echo "Missing KEY: \${KEY}" >> "\${LOGFILE}"; exit 3; }'
+ExecStartPre=/bin/bash -lc 'timeout 10 ssh -p "\${PORT}" -i "\${KEY}" "\${USER}@\${IP}" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile="\${KNOWN}" -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ConnectTimeout=7 -o ConnectionAttempts=1 "echo AUTH_OK" >> "\${LOGFILE}" 2>&1 || { echo "Key auth failed" >> "\${LOGFILE}"; exit 4; }'
 
-ExecStart=/bin/bash -lc '/usr/bin/autossh -M 0 -N \
--p "${PORT}" \
--i "${KEY}" \
--o BatchMode=yes \
--o StrictHostKeyChecking=no \
--o UserKnownHostsFile="${KNOWN}" \
--o PreferredAuthentications=publickey \
--o PubkeyAuthentication=yes \
--o PasswordAuthentication=no \
--o KbdInteractiveAuthentication=no \
--o IdentitiesOnly=yes \
--o ExitOnForwardFailure=yes \
--o ServerAliveInterval=15 \
--o ServerAliveCountMax=3 \
--o TCPKeepAlive=yes \
--o ConnectTimeout=7 \
--o ConnectionAttempts=1 \
-'"'"'$(if [[ "${MODE}" = "L" ]]; then
-          echo "-L ${LHOST}:${LPORT}:${RHOST}:${RPORT}"
-        else
-          echo "-R ${RHOST}:${RPORT}:${LHOST}:${LPORT}"
-        fi)'"'"' \
-  "${USER}@${IP}" >> "${LOGFILE}" 2>&1'
+ExecStart=/bin/bash -lc '/usr/bin/autossh -M 0 -N -p "\${PORT}" -i "\${KEY}" -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile="\${KNOWN}" -o PreferredAuthentications=publickey -o PubkeyAuthentication=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o IdentitiesOnly=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o TCPKeepAlive=yes -o ConnectTimeout=7 -o ConnectionAttempts=1 '"'"'$(if [[ "\${MODE}" = "L" ]]; then echo "-L \${LHOST}:\${LPORT}:\${RHOST}:\${RPORT}"; else echo "-R \${RHOST}:\${RPORT}:\${LHOST}:\${LPORT}"; fi)'"'"' "\${USER}@\${IP}" >> "\${LOGFILE}" 2>&1'
 
 Restart=always
 RestartSec=2
@@ -326,7 +215,7 @@ _is_listening_local(){
 }
 
 _is_listening_remote(){
-  timeout 10 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
+  timeout 8 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
     -o BatchMode=yes \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile="${KNOWN}" \
@@ -338,28 +227,12 @@ _is_listening_remote(){
     "command -v ss >/dev/null 2>&1 && ss -lntH \"sport = :${RPORT}\" | grep -q LISTEN" >/dev/null 2>&1
 }
 
-_wait_for_listen(){
-  local tries="${1:-10}" sleep_s="${2:-1}"
-  local i
-  for i in $(seq 1 "$tries"); do
-    if [[ "${MODE}" = "L" ]]; then
-      _is_listening_local && return 0
-    else
-      _is_listening_remote && return 0
-    fi
-    sleep "$sleep_s"
-  done
-  return 1
-}
-
-_service_brief(){
-  local active pid
-  active="$(systemctl is-active "${SERVICE}.service" 2>/dev/null || true)"
-  pid="$(systemctl show -p MainPID --value "${SERVICE}.service" 2>/dev/null || true)"
-  printf "%s•%s service:%s %s%s%s  %s(pid:%s%s%s)\n" \
-    "${DIM}${SILVER}" "${RESET}" "${RESET}" \
-    "${BOLD}${MUSTARD}" "${active:-unknown}" "${RESET}" \
-    "${DIM}${SILVER}" "${RESET}" "${SILVER}${pid:-?}${RESET}"
+_fail_minimal(){
+  local start_ts="$1"
+  printf "%s\n" "${BOLD}${MUSTARD}FAILED${RESET}"
+  journalctl -u "${SERVICE}.service" -b --since "${start_ts}" -n 30 --no-pager 2>/dev/null || true
+  tail -n 60 "${LOGFILE}" 2>/dev/null || true
+  exit 5
 }
 
 enable_start(){
@@ -368,23 +241,19 @@ enable_start(){
 
   systemctl daemon-reload
   systemctl enable "${SERVICE}.service" >/dev/null 2>&1 || true
-  systemctl restart "${SERVICE}.service"
 
-  _service_brief
+  systemctl restart "${SERVICE}.service" >/dev/null 2>&1 || _fail_minimal "${START_TS}"
 
-  if _wait_for_listen 8 1; then
-    if [[ "${MODE}" = "L" ]]; then
-      ok "listening -> ${LHOST}:${LPORT}"
-    else
-      ok "remote listening -> ${RHOST}:${RPORT}"
-    fi
-    return 0
+  sleep 1
+  systemctl is-active --quiet "${SERVICE}.service" || _fail_minimal "${START_TS}"
+
+  if [[ "${MODE}" = "L" ]]; then
+    _is_listening_local || _fail_minimal "${START_TS}"
+    ok "listening -> ${LHOST}:${LPORT}"
+  else
+    _is_listening_remote || _fail_minimal "${START_TS}"
+    ok "remote listening -> ${RHOST}:${RPORT}"
   fi
-
-  warn "verify failed (not listening yet). showing last logs:"
-  journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 80 --no-pager || true
-  tail -n 120 "${LOGFILE}" 2>/dev/null || true
-  exit 5
 }
 
 main(){
