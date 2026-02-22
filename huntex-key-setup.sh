@@ -1,16 +1,26 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-IP="${IP:-46.226.162.4}"
-PORT="${PORT:-2222}"
-USER="${USER:-root}"
-PASS="${PASS:-}"
-WIPE_KEYS="${WIPE_KEYS:-0}"
+# Color Definitions
+_have_tty()  { [[ -t 1 ]]; }
+_have_tput() { command -v tput >/dev/null 2>&1; }
 
-SSH_DIR="/root/.ssh"
+if _have_tty && _have_tput; then
+  SILVER="$(tput setaf 7)"     # silver/white
+  MUSTARD="$(tput setaf 3)"    # mustard/yellow-ish
+  DIM="$(tput dim)"
+  BOLD="$(tput bold)"
+  RESET="$(tput sgr0)"
+else
+  SILVER=""; MUSTARD=""; DIM=""; BOLD=""; RESET=""
+fi
 
-log(){ echo "[$(date +'%F %T')] $*"; }
-die(){ log "[FATAL] $*"; exit 1; }
+log(){ echo -e "[$(date +'%F %T')] ${CYAN}$*${RESET}"; }
+die(){ echo -e "${RED}❌ $*${RESET}" >&2; exit 1; }
+ok(){ echo -e "${GREEN}✅ $*${RESET}"; }
+warn(){ echo -e "${YELLOW}⚠️  $*${RESET}" >&2; }
+
+need_root(){ [[ "${EUID:-0}" -eq 0 ]] || die "Run as root (sudo)."; }
 
 [[ -n "$PASS" ]] || die "PASS is empty. Example: IP=... PASS='xxx' WIPE_KEYS=1 bash"
 
