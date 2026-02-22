@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ==========================================
+# ============================================================
 # HUNTEX Turbo AutoSSH Tunnel (MINIMAL+)
 # - Iran server runs autossh client
 # - Connects to OUTSIDE HPN-SSH: IP:PORT (default 2222)
@@ -10,7 +10,7 @@ set -Eeuo pipefail
 # - Uses key: /root/.ssh/id_ed25519_iran-$(hostname -s)
 # - systemd service + env file + CLI huntex-set-ip
 # - Fixes: old-log spam + unit escape errors + ensures restart applies new mode
-# ==========================================
+# ============================================================
 
 SERVICE="${SERVICE:-huntex-autossh-tunnel}"
 
@@ -43,10 +43,10 @@ UNIT_FILE="/etc/systemd/system/${SERVICE}.service"
 SETIP_BIN="/usr/local/bin/huntex-set-ip"
 LOGFILE="/var/log/${SERVICE}.log"
 
-die(){ echo "❌ $*" >&2; exit 1; }
-ok(){ echo "✅ $*"; }
-warn(){ echo "⚠️  $*" >&2; }
-log(){ echo "[$(date +'%F %T')] $*"; }
+die(){ echo -e "${RED}❌ $*${RESET}" >&2; exit 1; }
+ok(){ echo -e "${GREEN}✅ $*${RESET}"; }
+warn(){ echo -e "${YELLOW}⚠️  $*${RESET}" >&2; }
+log(){ echo -e "[$(date +'%F %T')] ${CYAN}$*${RESET}"; }
 
 need_root(){ [[ "${EUID:-0}" -eq 0 ]] || die "Run as root (sudo)."; }
 
@@ -107,74 +107,75 @@ set -Eeuo pipefail
 SERVICE="${SERVICE}"
 ENV_FILE="${ENV_FILE}"
 
-NEW_IP="\${1:-}"
-if [[ -z "\$NEW_IP" ]]; then
+NEW_IP="${1:-}"
+if [[ -z "$NEW_IP" ]]; then
   echo "Usage: huntex-set-ip NEW_IP"
   exit 1
 fi
 
-[[ -f "\$ENV_FILE" ]] || { echo "❌ Env file not found: \$ENV_FILE"; exit 2; }
+[[ -f "$ENV_FILE" ]] || { echo "❌ Env file not found: $ENV_FILE"; exit 2; }
 
-if ! [[ "\$NEW_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]]; then
-  echo "❌ Invalid IP format: \$NEW_IP"
+if ! [[ "$NEW_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  echo "❌ Invalid IP format: $NEW_IP"
   exit 3
 fi
 
-START_TS="\$(date +'%Y-%m-%d %H:%M:%S')"
+START_TS="$(date +'%Y-%m-%d %H:%M:%S')"
 
-echo "→ Updating IP to: \$NEW_IP"
-if grep -q '^IP=' "\$ENV_FILE"; then
-  sed -i "s/^IP=.*/IP=\${NEW_IP}/" "\$ENV_FILE"
+echo "→ Updating IP to: $NEW_IP"
+if grep -q '^IP=' "$ENV_FILE"; then
+  sed -i "s/^IP=.*/IP=${NEW_IP}/" "$ENV_FILE"
 else
-  echo "IP=\${NEW_IP}" >> "\$ENV_FILE"
+  echo "IP=${NEW_IP}" >> "$ENV_FILE"
 fi
 
-echo "→ Restarting \${SERVICE}.service ..."
+echo "→ Restarting ${SERVICE}.service ..."
 systemctl daemon-reload
-systemctl restart "\${SERVICE}.service"
+systemctl restart "${SERVICE}.service"
 sleep 1
 
 echo
-systemctl --no-pager --full status "\${SERVICE}.service" | sed -n '1,28p' || true
+systemctl --no-pager --full status "${SERVICE}.service" | sed -n '1,28p' || true
 
-MODE="\$(grep -E '^MODE=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-LPORT="\$(grep -E '^LPORT=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-RPORT="\$(grep -E '^RPORT=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-USER="\$(grep -E '^USER=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-IP="\$(grep -E '^IP=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-PORT="\$(grep -E '^PORT=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-KEY="\$(grep -E '^KEY=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-KNOWN="\$(grep -E '^KNOWN=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+MODE="$(grep -E '^MODE=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+LPORT="$(grep -E '^LPORT=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+RPORT="$(grep -E '^RPORT=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+USER="$(grep -E '^USER=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+IP="$(grep -E '^IP=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+PORT="$(grep -E '^PORT=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+KEY="$(grep -E '^KEY=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+KNOWN="$(grep -E '^KNOWN=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
 
 echo
-if [[ "\${MODE:-L}" = "L" ]]; then
-  if command -v ss >/dev/null 2>&1 && ss -lntH "sport = :\${LPORT}" | grep -q .; then
-    echo "✅ Tunnel is listening locally on \${LPORT}"
+if [[ "${MODE:-L}" = "L" ]]; then
+  if command -v ss >/dev/null 2>&1 && ss -lntH "sport = :${LPORT}" | grep -q .; then
+    echo "✅ Tunnel is listening locally on ${LHOST}:${LPORT}"
   else
-    echo "❌ Tunnel not listening locally on \${LPORT}"
-    journalctl -u "\${SERVICE}.service" -b --since "\${START_TS}" -n 200 --no-pager || true
+    echo "❌ Tunnel not listening locally on ${LHOST}:${LPORT}"
+    journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true
     exit 4
   fi
 else
   # MODE=R: verify remote listener exists (retry)
   for i in 1 2 3 4 5; do
-    if timeout 10 ssh -p "\${PORT}" -i "\${KEY}" "\${USER}@\${IP}" \
+    if timeout 10 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
       -o BatchMode=yes \
       -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile="\${KNOWN}" \
+      -o UserKnownHostsFile="${KNOWN}" \
       -o PreferredAuthentications=publickey \
       -o PubkeyAuthentication=yes \
       -o PasswordAuthentication=no \
       -o KbdInteractiveAuthentication=no \
       -o IdentitiesOnly=yes \
-      "command -v ss >/dev/null 2>&1 && ss -lntH \\"sport = :\${RPORT}\\" | grep -q LISTEN" >/dev/null 2>&1; then
-      echo "✅ Tunnel is listening on remote OUTSIDE port \${RPORT}"
+      "command -v ss >/dev/null 2>&1 && ss -lntH \"sport = :${RPORT}\" | grep -q LISTEN" >/dev/null 2>&1; then
+      echo "✅ Tunnel is listening on remote OUTSIDE port ${RPORT}"
       exit 0
     fi
     sleep 2
   done
-  echo "❌ Tunnel not listening on remote OUTSIDE port \${RPORT}"
-  journalctl -u "\${SERVICE}.service" -b --since "\${START_TS}" -n 200 --no-pager || true
+
+  echo "❌ Tunnel not listening on remote OUTSIDE port ${RPORT}"
+  journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true
   exit 4
 fi
 EOF
@@ -228,38 +229,38 @@ ExecStartPre=/bin/bash -lc '[[ -f "${KEY}" ]] || { echo "Missing KEY: ${KEY}" >>
 
 # Fail-fast key-only auth test
 ExecStartPre=/bin/bash -lc 'timeout 12 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
-  -o BatchMode=yes \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile="${KNOWN}" \
-  -o PreferredAuthentications=publickey \
-  -o PubkeyAuthentication=yes \
-  -o PasswordAuthentication=no \
-  -o KbdInteractiveAuthentication=no \
-  -o IdentitiesOnly=yes \
-  -o ExitOnForwardFailure=yes \
-  -o ConnectTimeout=7 \
-  -o ConnectionAttempts=1 \
-  "echo AUTH_OK" >> "${LOGFILE}" 2>&1 || { echo "Key auth failed" >> "${LOGFILE}"; tail -n 80 "${LOGFILE}" || true; exit 4; }'
+-o BatchMode=yes \
+-o StrictHostKeyChecking=no \
+-o UserKnownHostsFile="${KNOWN}" \
+-o PreferredAuthentications=publickey \
+-o PubkeyAuthentication=yes \
+-o PasswordAuthentication=no \
+-o KbdInteractiveAuthentication=no \
+-o IdentitiesOnly=yes \
+-o ExitOnForwardFailure=yes \
+-o ConnectTimeout=7 \
+-o ConnectionAttempts=1 \
+"echo AUTH_OK" >> "${LOGFILE}" 2>&1 || { echo "Key auth failed" >> "${LOGFILE}"; tail -n 80 "${LOGFILE}" || true; exit 4; }'
 
 # Main tunnel
 ExecStart=/bin/bash -lc '/usr/bin/autossh -M 0 -N \
-  -p "${PORT}" \
-  -i "${KEY}" \
-  -o BatchMode=yes \
-  -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile="${KNOWN}" \
-  -o PreferredAuthentications=publickey \
-  -o PubkeyAuthentication=yes \
-  -o PasswordAuthentication=no \
-  -o KbdInteractiveAuthentication=no \
-  -o IdentitiesOnly=yes \
-  -o ExitOnForwardFailure=yes \
-  -o ServerAliveInterval=15 \
-  -o ServerAliveCountMax=3 \
-  -o TCPKeepAlive=yes \
-  -o ConnectTimeout=7 \
-  -o ConnectionAttempts=1 \
-  '"'"'$(if [[ "${MODE}" = "L" ]]; then
+-p "${PORT}" \
+-i "${KEY}" \
+-o BatchMode=yes \
+-o StrictHostKeyChecking=no \
+-o UserKnownHostsFile="${KNOWN}" \
+-o PreferredAuthentications=publickey \
+-o PubkeyAuthentication=yes \
+-o PasswordAuthentication=no \
+-o KbdInteractiveAuthentication=no \
+-o IdentitiesOnly=yes \
+-o ExitOnForwardFailure=yes \
+-o ServerAliveInterval=15 \
+-o ServerAliveCountMax=3 \
+-o TCPKeepAlive=yes \
+-o ConnectTimeout=7 \
+-o ConnectionAttempts=1 \
+'"'"'$(if [[ "${MODE}" = "L" ]]; then
           echo "-L ${LHOST}:${LPORT}:${RHOST}:${RPORT}"
         else
           echo "-R ${RHOST}:${RPORT}:${LHOST}:${LPORT}"
@@ -321,10 +322,11 @@ enable_start(){
       sleep 2
     done
 
-    warn "Tunnel may not be listening remotely yet. Showing logs:"
-    journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true
-    tail -n 120 "${LOGFILE}" 2>/dev/null || true
+    warn "Tunnel may not be listening remotely yet. Showing logs:"  
+    journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true  
+    tail -n 120 "${LOGFILE}" 2>/dev/null || true  
     exit 5
+
   fi
 }
 
@@ -335,15 +337,15 @@ main(){
   ensure_prereqs
   ensure_key
 
-  log "[*] MODE=${MODE}"
-  log "[*] Using NAME=${NAME}"
-  log "[*] KEY=${KEY}"
-  log "[*] OUTSIDE=${USER}@${IP}:${PORT}"
+  log "[] MODE=${MODE}"
+  log "[] Using NAME=${NAME}"
+  log "[] KEY=${KEY}"
+  log "[] OUTSIDE=${USER}@${IP}:${PORT}"
 
   if [[ "${MODE}" = "L" ]]; then
-    log "[*] LOCAL LISTEN=${LHOST}:${LPORT} -> OUTSIDE TARGET=${RHOST}:${RPORT}"
+    log "[] LOCAL LISTEN=${LHOST}:${LPORT} -> OUTSIDE TARGET=${RHOST}:${RPORT}"
   else
-    log "[*] REMOTE LISTEN=${RHOST}:${RPORT} -> LOCAL TARGET=${LHOST}:${LPORT}"
+    log "[] REMOTE LISTEN=${RHOST}:${RPORT} -> LOCAL TARGET=${LHOST}:${LPORT}"
   fi
 
   write_env
