@@ -10,18 +10,18 @@ _have_tty()  { [[ -t 1 ]]; }
 _have_tput() { command -v tput >/dev/null 2>&1; }
 
 _full_reset_screen() {
+_full_reset_screen() {
   if _have_tty; then
-    # Reset terminal (RIS)
-    printf '\033c'
+    # Termius-friendly reset (avoids RIS)
+    if command -v tput >/dev/null 2>&1; then
+      tput sgr0 || true
+      tput reset || true
+    else
+      printf '\e[0m\e[H\e[2J'
+    fi
 
-    # Clear scrollback buffer
-    printf '\e[3J'
-
-    # Move cursor home
-    printf '\e[H'
-
-    # Clear screen
-    printf '\e[2J'
+    # wipe scrollback too
+    printf '\e[3J\e[H\e[2J'
   fi
 }
 
