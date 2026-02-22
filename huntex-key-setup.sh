@@ -11,9 +11,17 @@ _have_tput() { command -v tput >/dev/null 2>&1; }
 
 _full_reset_screen() {
   if _have_tty; then
-    printf '\033c' || true
-    command -v tput >/dev/null 2>&1 && tput reset || true
-    printf '\e[3J\e[H\e[2J' || true
+    # Reset terminal (RIS)
+    printf '\033c'
+
+    # Clear scrollback buffer
+    printf '\e[3J'
+
+    # Move cursor home
+    printf '\e[H'
+
+    # Clear screen
+    printf '\e[2J'
   fi
 }
 
