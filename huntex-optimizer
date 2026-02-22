@@ -144,7 +144,11 @@ hr
 
 step "Phase 3 — AutoSSH hardening (only if service exists)"
 UNIT="huntex-autossh-tunnel.service"
-if systemctl list-unit-files | grep -q "^${UNIT}"; then
+
+# robust detection:
+# - works whether unit is enabled/disabled
+# - works even if only loaded+active (no unit-file match issues)
+if systemctl status "${UNIT}" >/dev/null 2>&1; then
   info "Found: ${BOLD}${UNIT}${RESET}"
   info "Applying: ${BOLD}LimitNOFILE=1048576${RESET} + restart policy"
   run "mkdir -p /etc/systemd/system/${UNIT}.d"
@@ -156,6 +160,7 @@ RestartSec=5
 StartLimitIntervalSec=0
 UNITCFG
   run "systemctl daemon-reload"
+  run "systemctl reset-failed ${UNIT} >/dev/null 2>&1 || true"
   run "systemctl restart ${UNIT} >/dev/null 2>&1 || true"
   ok "AutoSSH service tuned"
 else
