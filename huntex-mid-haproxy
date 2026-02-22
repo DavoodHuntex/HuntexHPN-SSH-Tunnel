@@ -42,6 +42,9 @@ fi
 _hr() { printf "%s\n" "${DIM}${SILVER}────────────────────────────────────────────────────────────${RESET}"; }
 _box() {
   local title="$1" subtitle="$2"
+  title="${title:-"No Title"}"
+  subtitle="${subtitle:-"No Subtitle"}"
+
   _hr
   printf "%s┌──────────────────────────────────────────────────────────┐%s\n" "${DIM}${SILVER}" "${RESET}"
   printf "%s│%s %s%s%s%*s%s│%s\n" \
