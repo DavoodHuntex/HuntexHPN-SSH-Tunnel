@@ -18,14 +18,12 @@ _have_tput() { command -v tput >/dev/null 2>&1; }
 
 _full_reset_screen() {
   if _have_tty; then
-    # Termius-friendly reset (avoid RIS \033c)
     if _have_tput; then
       tput sgr0 >/dev/null 2>&1 || true
       tput reset >/dev/null 2>&1 || true
     else
       printf '\e[0m\e[H\e[2J'
     fi
-    # wipe scrollback too
     printf '\e[3J\e[H\e[2J'
   fi
 }
@@ -40,7 +38,6 @@ else
   SILVER=""; MUSTARD=""; DIM=""; BOLD=""; RESET=""
 fi
 
-# Backward-compatible color vars (avoid unbound variable with -u)
 RED="${RED:-${MUSTARD}}"
 GREEN="${GREEN:-${MUSTARD}}"
 YELLOW="${YELLOW:-${MUSTARD}}"
@@ -86,23 +83,18 @@ need_root(){ [[ "${EUID:-0}" -eq 0 ]] || die "Run as root (sudo)."; }
 # -------------------- Original Script --------------------
 SERVICE="${SERVICE:-huntex-autossh-tunnel}"
 
-# Forward mode: L or R
 MODE="${MODE:-L}"   # L=local forward (-L), R=reverse forward (-R)
 
-# OUTSIDE (HPN-SSH server)
 IP="${IP:-46.226.162.4}"
 PORT="${PORT:-2222}"
 USER="${USER:-root}"
 
-# LOCAL endpoint (on IRAN)
 LHOST="${LHOST:-0.0.0.0}"
 LPORT="${LPORT:-443}"
 
-# REMOTE endpoint (on OUTSIDE)
 RHOST="${RHOST:-127.0.0.1}"
 RPORT="${RPORT:-443}"
 
-# Key naming: iran-[hostname]
 HNAME="$(hostname -s 2>/dev/null || hostname || echo unknown)"
 NAME="${NAME:-iran-${HNAME}}"
 KEY="${KEY:-/root/.ssh/id_ed25519_${NAME}}"
@@ -161,7 +153,7 @@ KNOWN=${KNOWN}
 LOGFILE=${LOGFILE}
 EOF
   chmod 600 "$ENV_FILE" || true
-  ok "Wrote env -> $ENV_FILE"
+  ok "env -> $ENV_FILE"
 }
 
 write_setip(){
@@ -244,7 +236,7 @@ else
 fi
 EOF
   chmod +x "$SETIP_BIN" || true
-  ok "Installed CLI -> $SETIP_BIN  (use: huntex-set-ip x.x.x.x)"
+  ok "cli -> $SETIP_BIN"
 }
 
 write_unit(){
@@ -325,7 +317,49 @@ KillSignal=SIGTERM
 WantedBy=multi-user.target
 EOF
 
-  ok "Wrote unit -> $UNIT_FILE"
+  ok "unit -> $UNIT_FILE"
+}
+
+_is_listening_local(){
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -lntH "sport = :${LPORT}" | grep -q .
+}
+
+_is_listening_remote(){
+  timeout 10 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
+    -o BatchMode=yes \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile="${KNOWN}" \
+    -o PreferredAuthentications=publickey \
+    -o PubkeyAuthentication=yes \
+    -o PasswordAuthentication=no \
+    -o KbdInteractiveAuthentication=no \
+    -o IdentitiesOnly=yes \
+    "command -v ss >/dev/null 2>&1 && ss -lntH \"sport = :${RPORT}\" | grep -q LISTEN" >/dev/null 2>&1
+}
+
+_wait_for_listen(){
+  local tries="${1:-10}" sleep_s="${2:-1}"
+  local i
+  for i in $(seq 1 "$tries"); do
+    if [[ "${MODE}" = "L" ]]; then
+      _is_listening_local && return 0
+    else
+      _is_listening_remote && return 0
+    fi
+    sleep "$sleep_s"
+  done
+  return 1
+}
+
+_service_brief(){
+  local active pid
+  active="$(systemctl is-active "${SERVICE}.service" 2>/dev/null || true)"
+  pid="$(systemctl show -p MainPID --value "${SERVICE}.service" 2>/dev/null || true)"
+  printf "%s•%s service:%s %s%s%s  %s(pid:%s%s%s)\n" \
+    "${DIM}${SILVER}" "${RESET}" "${RESET}" \
+    "${BOLD}${MUSTARD}" "${active:-unknown}" "${RESET}" \
+    "${DIM}${SILVER}" "${RESET}" "${SILVER}${pid:-?}${RESET}"
 }
 
 enable_start(){
@@ -336,43 +370,21 @@ enable_start(){
   systemctl enable "${SERVICE}.service" >/dev/null 2>&1 || true
   systemctl restart "${SERVICE}.service"
 
-  echo
-  systemctl --no-pager --full status "${SERVICE}.service" | sed -n '1,32p' || true
-  echo
+  _service_brief
 
-  if [[ "${MODE}" = "L" ]]; then
-    if command -v ss >/dev/null 2>&1 && ss -lntH "sport = :${LPORT}" | grep -q .; then
-      ok "Tunnel is listening locally on ${LHOST}:${LPORT}"
+  if _wait_for_listen 8 1; then
+    if [[ "${MODE}" = "L" ]]; then
+      ok "listening -> ${LHOST}:${LPORT}"
     else
-      warn "Tunnel may not be listening yet. Showing logs:"
-      journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true
-      tail -n 120 "${LOGFILE}" 2>/dev/null || true
-      exit 5
+      ok "remote listening -> ${RHOST}:${RPORT}"
     fi
-  else
-    local i
-    for i in 1 2 3 4 5; do
-      if timeout 10 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
-        -o BatchMode=yes \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile="${KNOWN}" \
-        -o PreferredAuthentications=publickey \
-        -o PubkeyAuthentication=yes \
-        -o PasswordAuthentication=no \
-        -o KbdInteractiveAuthentication=no \
-        -o IdentitiesOnly=yes \
-        "command -v ss >/dev/null 2>&1 && ss -lntH \"sport = :${RPORT}\" | grep -q LISTEN" >/dev/null 2>&1; then
-        ok "Tunnel is listening on remote OUTSIDE ${RHOST}:${RPORT}"
-        return 0
-      fi
-      sleep 2
-    done
-
-    warn "Tunnel may not be listening remotely yet. Showing logs:"
-    journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true
-    tail -n 120 "${LOGFILE}" 2>/dev/null || true
-    exit 5
+    return 0
   fi
+
+  warn "verify failed (not listening yet). showing last logs:"
+  journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 80 --no-pager || true
+  tail -n 120 "${LOGFILE}" 2>/dev/null || true
+  exit 5
 }
 
 main(){
