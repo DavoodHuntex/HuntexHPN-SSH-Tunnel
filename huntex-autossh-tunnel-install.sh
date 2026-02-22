@@ -335,7 +335,8 @@ enable_start(){
     fi
   else
     # MODE=R: verify remote listener exists (retry; FIX#2 fallback)
-    local i ok_remote=0
+    # MODE=R: verify remote listener exists (retry to avoid false-negative)
+    local i
     for i in 1 2 3 4 5; do
       if timeout 10 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
         -o BatchMode=yes \
@@ -346,25 +347,14 @@ enable_start(){
         -o PasswordAuthentication=no \
         -o KbdInteractiveAuthentication=no \
         -o IdentitiesOnly=yes \
-        '(
-          if command -v ss >/dev/null 2>&1; then
-            ss -lntH "sport = :'"${RPORT}"'" | grep -q LISTEN
-          elif command -v netstat >/dev/null 2>&1; then
-            netstat -lnt 2>/dev/null | awk "{print \\\$4}" | grep -Eq "(:|\.)'"${RPORT}"'\$"
-          elif command -v lsof >/dev/null 2>&1; then
-            lsof -nP -iTCP:'"${RPORT}"' -sTCP:LISTEN >/dev/null 2>&1
-          else
-            exit 2
-          fi
-        )' >/dev/null 2>&1; then
-        ok_remote=1
+        "bash -lc 'if command -v ss >/dev/null 2>&1; then ss -lntH \"sport = :${RPORT}\" | grep -q LISTEN; else netstat -lnt 2>/dev/null | awk \"{print \\$4}\" | grep -q \":${RPORT}\$\"; fi'" >/dev/null 2>&1; then
         ok "Tunnel is listening on remote OUTSIDE ${RHOST}:${RPORT}"
         break
       fi
       sleep 2
     done
 
-    if [[ "${ok_remote}" -ne 1 ]]; then
+    if [[ "${i}" -ge 5 ]]; then
       warn "Tunnel may not be listening remotely yet. Showing logs:"
       journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true
       tail -n 120 "${LOGFILE}" 2>/dev/null || true
