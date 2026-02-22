@@ -1,48 +1,56 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Color Definitions
-_have_tty()  { [[ -t 1 ]]; }
-_have_tput() { command -v tput >/dev/null 2>&1; }
+# ============================================
+# HUNTEX Turbo AutoSSH Tunnel (MINIMAL+)
+# - Iran server runs autossh client
+# - Connects to OUTSIDE HPN-SSH: IP:PORT (default 2222)
+# - MODE=L (default): local forward  (-L)  => IRAN listens, forwards to OUTSIDE target
+# - MODE=R           : reverse forward (-R) => OUTSIDE listens, forwards to IRAN target
+# - Uses key: /root/.ssh/id_ed25519_iran-$(hostname -s)
+# - systemd service + env file + CLI huntex-set-ip
+# - Fixes: old-log spam + unit escape errors + ensures restart applies new mode
+# ============================================
 
-if _have_tty && _have_tput; then
-  SILVER="$(tput setaf 7)"     # silver/white
-  MUSTARD="$(tput setaf 3)"    # mustard/yellow-ish
-  DIM="$(tput dim)"
-  BOLD="$(tput bold)"
-  RESET="$(tput sgr0)"
-else
-  SILVER=""; MUSTARD=""; DIM=""; BOLD=""; RESET=""
-fi
+# ---------------------- Variables --------------------------
+IP="${IP:-46.226.162.4}"
+PORT="${PORT:-2222}"
+USER="${USER:-root}"
+PASS="${PASS:-}"
+WIPE_KEYS="${WIPE_KEYS:-0}"
 
-log(){ echo -e "[$(date +'%F %T')] ${CYAN}$*${RESET}"; }
-die(){ echo -e "${RED}❌ $*${RESET}" >&2; exit 1; }
-ok(){ echo -e "${GREEN}✅ $*${RESET}"; }
-warn(){ echo -e "${YELLOW}⚠️  $*${RESET}" >&2; }
+SSH_DIR="/root/.ssh"
 
-need_root(){ [[ "${EUID:-0}" -eq 0 ]] || die "Run as root (sudo)."; }
+log(){ echo -e "[$(date +'%F %T')] $*"; }
+die(){ log "[FATAL] $*"; exit 1; }
 
+ok(){ echo -e "✅ $*"; }
+warn(){ echo -e "⚠️  $*" >&2; }
+
+# ---------------------- Validate Password ----------------------
 [[ -n "$PASS" ]] || die "PASS is empty. Example: IP=... PASS='xxx' WIPE_KEYS=1 bash"
 
-# ---- NAME = iran-[hostname] ----
+# ---------------------- Name and Key ------------------------
 HN="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
 NAME="iran-${HN}"
 KEY="${SSH_DIR}/id_ed25519_${NAME}"
 PUB="${KEY}.pub"
 KNOWN="${SSH_DIR}/known_hosts_${NAME}"
 
-# ---- deps (quiet, no-fail hard) ----
+# ---------------------- Install dependencies ----------------------
+log "[*] Installing dependencies..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null 2>&1 || true
 apt-get install -y openssh-client sshpass >/dev/null 2>&1 || true
 
-# ---- ensure ssh dir ----
+# ---------------------- Ensure SSH Directory -------------------
+log "[*] Ensuring SSH directory exists..."
 mkdir -p "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 
-# ---- optional wipe (local only) ----
+# ---------------------- Wipe Previous Keys -------------------
 if [[ "$WIPE_KEYS" == "1" ]]; then
-  log "[!] WIPE_KEYS=1 -> removing local id_* + known_hosts_* (keeping authorized_keys)"
+  log "[!] WIPE_KEYS=1 -> Removing local id_* + known_hosts_* (keeping authorized_keys)"
   find "$SSH_DIR" -maxdepth 1 -type f \
     \( -name "id_*" -o -name "known_hosts*" \) \
     ! -name "authorized_keys" -delete || true
@@ -51,12 +59,13 @@ fi
 log "[*] Using NAME=${NAME}"
 rm -f "$KEY" "$PUB" "$KNOWN" || true
 
+# ---------------------- Generate SSH Key ----------------------
 log "[*] Generating key: $KEY"
 ssh-keygen -t ed25519 -f "$KEY" -N "" -C "${NAME}@$(hostname -f 2>/dev/null || hostname)" >/dev/null 2>&1 || die "ssh-keygen failed"
 chmod 600 "$KEY" || true
 chmod 644 "$PUB" || true
 
-# ---- quick TCP check ----
+# ---------------------- Quick TCP Check ----------------------
 log "[*] Checking TCP port ${PORT} on ${IP}..."
 if timeout 5 bash -lc "cat </dev/null >/dev/tcp/${IP}/${PORT}" >/dev/null 2>&1; then
   log "[+] ${PORT} OPEN"
@@ -64,7 +73,7 @@ else
   die "${PORT} CLOSED (network/firewall)"
 fi
 
-# ---- SSH options (IMPORTANT: -n + stdin=/dev/null to avoid pipe hang) ----
+# ---------------------- SSH Options --------------------------
 SSH_BASE_OPTS=(
   -n
   -p "$PORT"
@@ -79,7 +88,7 @@ SSH_BASE_OPTS=(
   -o LogLevel=ERROR
 )
 
-# for password stage, allow BOTH password + keyboard-interactive (your server needs it)
+# ---------------------- Password Authentication ----------------------
 SSH_PASS_OPTS=(
   -o PreferredAuthentications=password,keyboard-interactive
   -o PasswordAuthentication=yes
@@ -88,6 +97,7 @@ SSH_PASS_OPTS=(
   -o NumberOfPasswordPrompts=1
 )
 
+# ---------------------- Retry Function ----------------------
 retry(){
   local n=0 max=25 delay=1
   until "$@"; do
@@ -97,6 +107,7 @@ retry(){
   done
 }
 
+# ---------------------- Install Key on Remote ----------------------
 PUBKEY_CONTENT="$(cat "$PUB")"
 
 REMOTE_PREP=$'set -e\numask 077\nmkdir -p /root/.ssh\nchmod 700 /root/.ssh\ntouch /root/.ssh/authorized_keys\nchmod 600 /root/.ssh/authorized_keys\n'
@@ -111,6 +122,7 @@ log "[*] Installing key on remote (append)..."
 retry sshpass -p "$PASS" ssh "${SSH_BASE_OPTS[@]}" "${SSH_PASS_OPTS[@]}" "$USER@$IP" "$REMOTE_APPEND" \
   || die "append key failed"
 
+# ---------------------- Verifying Key-Only Login ----------------------
 log "[*] Verifying key-only login..."
 ssh "${SSH_BASE_OPTS[@]}" -i "$KEY" \
   -o PreferredAuthentications=publickey \
