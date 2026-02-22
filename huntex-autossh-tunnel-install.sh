@@ -36,6 +36,29 @@ warn()  { printf "%s⚠️ %s%s\n" "${BOLD}${MUSTARD}" "$*" "${RESET}" >&2; }
 die()   { printf "%s❌ %s%s\n" "${BOLD}${MUSTARD}" "$*" "${RESET}" >&2; exit 1; }
 phase() { printf "%s▶%s %s%s%s\n" "${DIM}${SILVER}" "${RESET}" "${BOLD}${MUSTARD}" "$*" "${RESET}"; }
 
+# ==================== Box Function for Output ====================
+_box() {
+  local title="${1:-No Title}"
+  local subtitle="${2:-No Subtitle}"
+  local width=58
+  local tpad=$(( width - ${#title} )); (( tpad < 0 )) && tpad=0
+  local spad=$(( width - ${#subtitle} )); (( spad < 0 )) && spad=0
+
+  printf "%s┌──────────────────────────────────────────────────────────┐%s\n" "${DIM}${SILVER}" "${RESET}"
+  printf "%s│%s %s%s%s%s%s│%s\n" \
+    "${DIM}${SILVER}" "${RESET}" \
+    "${BOLD}${MUSTARD}${title}${RESET}" \
+    "$(_pad "$tpad")" \
+    "${DIM}${SILVER}" "${RESET}"
+  printf "%s│%s %s%s%s%s│%s\n" \
+    "${DIM}${SILVER}" "${RESET}" \
+    "${DIM}${SILVER}${subtitle}${RESET}" \
+    "$(_pad "$spad")" \
+    "${DIM}${SILVER}" "${RESET}"
+  printf "%s└──────────────────────────────────────────────────────────┘%s\n" "${DIM}${SILVER}" "${RESET}"
+  _hr
+}
+
 # ==================== Variables ====================
 SERVICE="${SERVICE:-huntex-autossh-tunnel}"
 MODE="${MODE:-L}"
