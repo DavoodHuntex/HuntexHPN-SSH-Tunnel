@@ -2,19 +2,14 @@
 set -Eeuo pipefail
 
 # ==========================================
-# HUNTEX Turbo AutoSSH Tunnel (FINAL+)
+# HUNTEX Turbo AutoSSH Tunnel (MINIMAL+)
 # - Iran server runs autossh client
 # - Connects to OUTSIDE HPN-SSH: IP:PORT (default 2222)
 # - MODE=L (default): local forward  (-L)  => IRAN listens, forwards to OUTSIDE target
 # - MODE=R           : reverse forward (-R) => OUTSIDE listens, forwards to IRAN target
 # - Uses key: /root/.ssh/id_ed25519_iran-$(hostname -s)
-# - NO prompt, FAIL-FAST, auto reconnect
 # - systemd service + env file + CLI huntex-set-ip
-#
-# Fixes (ONLY):
-#  1) Ensure local "ss" exists by installing iproute2 (avoid skipped checks)
-#  2) MODE=R remote-listener check: fallback (ss/netstat/lsof) to avoid false negatives
-#  3) MODE=R preflight: verify remote AllowTcpForwarding (and GatewayPorts if needed)
+# - Fixes: old-log spam + unit escape errors + ensures restart applies new mode
 # ==========================================
 
 SERVICE="${SERVICE:-huntex-autossh-tunnel}"
@@ -65,8 +60,7 @@ validate_mode(){
 install_pkgs(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y >/dev/null 2>&1 || true
-  # FIX#1: include iproute2 so "ss" exists
-  apt-get install -y autossh openssh-client sshpass ca-certificates coreutils iproute2 >/dev/null 2>&1 || true
+  apt-get install -y autossh openssh-client ca-certificates coreutils >/dev/null 2>&1 || true
 }
 
 ensure_prereqs(){
@@ -75,14 +69,13 @@ ensure_prereqs(){
   command -v ssh-keyscan >/dev/null 2>&1 || die "ssh-keyscan missing (openssh-client broken?)"
   command -v timeout >/dev/null 2>&1 || die "timeout missing (coreutils missing?)"
   command -v systemctl >/dev/null 2>&1 || die "systemd required (systemctl not found)"
-  # After iproute2 install, ss should exist; still guard:
-  command -v ss >/dev/null 2>&1 || die "ss not found (iproute2 install failed?)"
+  command -v ss >/dev/null 2>&1 || warn "ss not found (install iproute2) — some checks will be skipped."
 }
 
 ensure_key(){
   mkdir -p "$SSH_DIR"
   chmod 700 "$SSH_DIR" || true
-  [[ -f "$KEY" ]] || die "SSH key not found: $KEY (run your key-setup first on IRAN so this key exists + is authorized on OUTSIDE)"
+  [[ -f "$KEY" ]] || die "SSH key not found: $KEY (run key-setup first so this key exists + is authorized on OUTSIDE)"
   chmod 600 "$KEY" || true
 }
 
@@ -127,7 +120,7 @@ if ! [[ "\$NEW_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]]; then
   exit 3
 fi
 
-START_TS="\$(date '+%Y-%m-%d %H:%M:%S')"
+START_TS="\$(date +'%Y-%m-%d %H:%M:%S')"
 
 echo "→ Updating IP to: \$NEW_IP"
 if grep -q '^IP=' "\$ENV_FILE"; then
@@ -142,7 +135,7 @@ systemctl restart "\${SERVICE}.service"
 sleep 1
 
 echo
-systemctl --no-pager --full status "\${SERVICE}.service" | sed -n '1,22p' || true
+systemctl --no-pager --full status "\${SERVICE}.service" | sed -n '1,28p' || true
 
 MODE="\$(grep -E '^MODE=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
 LPORT="\$(grep -E '^LPORT=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
@@ -155,7 +148,7 @@ KNOWN="\$(grep -E '^KNOWN=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
 
 echo
 if [[ "\${MODE:-L}" = "L" ]]; then
-  if ss -lntH "sport = :\${LPORT}" | grep -q .; then
+  if command -v ss >/dev/null 2>&1 && ss -lntH "sport = :\${LPORT}" | grep -q .; then
     echo "✅ Tunnel is listening locally on \${LPORT}"
   else
     echo "❌ Tunnel not listening locally on \${LPORT}"
@@ -163,7 +156,7 @@ if [[ "\${MODE:-L}" = "L" ]]; then
     exit 4
   fi
 else
-  # MODE=R: check remote listener (retry; FIX#2: fallback to netstat/lsof if ss missing)
+  # MODE=R: verify remote listener exists (retry)
   for i in 1 2 3 4 5; do
     if timeout 10 ssh -p "\${PORT}" -i "\${KEY}" "\${USER}@\${IP}" \
       -o BatchMode=yes \
@@ -174,17 +167,7 @@ else
       -o PasswordAuthentication=no \
       -o KbdInteractiveAuthentication=no \
       -o IdentitiesOnly=yes \
-      '(
-          if command -v ss >/dev/null 2>&1; then
-            ss -lntH "sport = :'\${RPORT}'" | grep -q LISTEN
-          elif command -v netstat >/dev/null 2>&1; then
-            netstat -lnt 2>/dev/null | awk "{print \\\$4}" | grep -Eq "(:|\.)'\${RPORT}'\$"
-          elif command -v lsof >/dev/null 2>&1; then
-            lsof -nP -iTCP:"'\${RPORT}'" -sTCP:LISTEN >/dev/null 2>&1
-          else
-            exit 2
-          fi
-        )' >/dev/null 2>&1; then
+      "command -v ss >/dev/null 2>&1 && ss -lntH \\"sport = :\${RPORT}\\" | grep -q LISTEN" >/dev/null 2>&1; then
       echo "✅ Tunnel is listening on remote OUTSIDE port \${RPORT}"
       exit 0
     fi
@@ -200,19 +183,19 @@ EOF
 }
 
 write_unit(){
-  local FWD_DESC FWD_ARG
-
+  local DESC
   if [[ "${MODE}" = "L" ]]; then
-    FWD_DESC="${LHOST}:${LPORT} -> ${RHOST}:${RPORT}"
-    FWD_ARG="-L \${LHOST}:\${LPORT}:\${RHOST}:\${RPORT}"
+    DESC="${LHOST}:${LPORT} -> ${RHOST}:${RPORT}"
   else
-    FWD_DESC="REMOTE ${RHOST}:${RPORT} -> LOCAL ${LHOST}:${LPORT}"
-    FWD_ARG="-R \${RHOST}:\${RPORT}:\${LHOST}:\${LPORT}"
+    DESC="REMOTE ${RHOST}:${RPORT} -> LOCAL ${LHOST}:${LPORT}"
   fi
 
+  # IMPORTANT:
+  # - No \${...} in unit file (systemd escape bug)
+  # - Use bash -lc so normal ${VAR} expands at runtime
   cat >"$UNIT_FILE" <<EOF
 [Unit]
-Description=HUNTEX Turbo AutoSSH Tunnel (MODE=${MODE} | ${FWD_DESC} via ${USER}@${IP}:${PORT})
+Description=HUNTEX Turbo AutoSSH Tunnel (MODE=${MODE} | ${DESC} via ${USER}@${IP}:${PORT})
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -228,23 +211,26 @@ Environment=AUTOSSH_POLL=10
 Environment=AUTOSSH_FIRST_POLL=5
 Environment=AUTOSSH_LOGLEVEL=0
 
-ExecStartPre=/bin/bash -lc 'mkdir -p /root/.ssh; chmod 700 /root/.ssh; : > "\${LOGFILE}"; chmod 600 "\${LOGFILE}" || true'
+# Prepare log + ssh dir (truncate log each start)
+ExecStartPre=/bin/bash -lc 'mkdir -p /root/.ssh; chmod 700 /root/.ssh; : > "${LOGFILE}"; chmod 600 "${LOGFILE}" || true'
 
-# Fail if local port already in use (only in MODE=L)
-ExecStartPre=/bin/bash -lc 'if [[ "\${MODE}" = "L" ]]; then ss -lntH "sport = :\${LPORT}" | grep -q . && { echo "Port \${LPORT} already in use" >> "\${LOGFILE}"; exit 1; } || true; fi'
+# Fail if local port already in use (only MODE=L)
+ExecStartPre=/bin/bash -lc 'if [[ "${MODE}" = "L" ]] && command -v ss >/dev/null 2>&1; then ss -lntH "sport = :${LPORT}" | grep -q . && { echo "Port ${LPORT} already in use" >> "${LOGFILE}"; exit 1; } || true; fi'
 
 # TCP reachability to outside SSH port
-ExecStartPre=/bin/bash -lc 'timeout 5 bash -lc "cat </dev/null >/dev/tcp/\${IP}/\${PORT}" >/dev/null 2>&1 || { echo "TCP \${IP}:\${PORT} unreachable" >> "\${LOGFILE}"; exit 2; }'
+ExecStartPre=/bin/bash -lc 'timeout 5 bash -lc "cat </dev/null >/dev/tcp/${IP}/${PORT}" >/dev/null 2>&1 || { echo "TCP ${IP}:${PORT} unreachable" >> "${LOGFILE}"; exit 2; }'
 
-# Refresh dedicated known_hosts
-ExecStartPre=/bin/bash -lc 'rm -f "\${KNOWN}" || true; timeout 7 ssh-keyscan -p "\${PORT}" -H "\${IP}" > "\${KNOWN}" 2>/dev/null || true; chmod 600 "\${KNOWN}" || true'
+# Refresh dedicated known_hosts (no prompt ever)
+ExecStartPre=/bin/bash -lc 'rm -f "${KNOWN}" || true; timeout 7 ssh-keyscan -p "${PORT}" -H "${IP}" > "${KNOWN}" 2>/dev/null || true; chmod 600 "${KNOWN}" || true'
+
+# Fail-fast key existence
+ExecStartPre=/bin/bash -lc '[[ -f "${KEY}" ]] || { echo "Missing KEY: ${KEY}" >> "${LOGFILE}"; exit 3; }; chmod 600 "${KEY}" || true'
 
 # Fail-fast key-only auth test
-ExecStartPre=/bin/bash -lc '[[ -f "\${KEY}" ]] || { echo "Missing KEY: \${KEY}" >> "\${LOGFILE}"; exit 3; }; chmod 600 "\${KEY}" || true'
-ExecStartPre=/bin/bash -lc 'timeout 12 ssh -p "\${PORT}" -i "\${KEY}" "\${USER}@\${IP}" \
+ExecStartPre=/bin/bash -lc 'timeout 12 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
   -o BatchMode=yes \
   -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile="\${KNOWN}" \
+  -o UserKnownHostsFile="${KNOWN}" \
   -o PreferredAuthentications=publickey \
   -o PubkeyAuthentication=yes \
   -o PasswordAuthentication=no \
@@ -253,40 +239,15 @@ ExecStartPre=/bin/bash -lc 'timeout 12 ssh -p "\${PORT}" -i "\${KEY}" "\${USER}@
   -o ExitOnForwardFailure=yes \
   -o ConnectTimeout=7 \
   -o ConnectionAttempts=1 \
-  "echo AUTH_OK" >> "\${LOGFILE}" 2>&1 || { echo "Key auth failed" >> "\${LOGFILE}"; tail -n 80 "\${LOGFILE}" || true; exit 4; }'
+  "echo AUTH_OK" >> "${LOGFILE}" 2>&1 || { echo "Key auth failed" >> "${LOGFILE}"; tail -n 80 "${LOGFILE}" || true; exit 4; }'
 
-# FIX#3: MODE=R preflight remote permissions (AllowTcpForwarding; GatewayPorts if non-local RHOST)
-ExecStartPre=/bin/bash -lc 'if [[ "\${MODE}" = "R" ]]; then \
-  timeout 12 ssh -p "\${PORT}" -i "\${KEY}" "\${USER}@\${IP}" \
-    -o BatchMode=yes \
-    -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile="\${KNOWN}" \
-    -o PreferredAuthentications=publickey \
-    -o PubkeyAuthentication=yes \
-    -o PasswordAuthentication=no \
-    -o KbdInteractiveAuthentication=no \
-    -o IdentitiesOnly=yes \
-    "bash -lc '\'' \
-      CFG=\"/etc/hpnssh/hpnsshd_config\"; \
-      if [[ -f \"\$CFG\" ]]; then \
-        ATF=\$(grep -iE \"^\\s*AllowTcpForwarding\\s+\" \"\$CFG\" | tail -n1 | awk \"{print tolower(\\\$2)}\"); \
-        [[ \"\$ATF\" = \"yes\" || -z \"\$ATF\" ]] || { echo \"AllowTcpForwarding is not yes\"; exit 21; }; \
-        RH=\"\${RHOST}\"; \
-        if [[ \"\$RH\" != \"127.0.0.1\" && \"\$RH\" != \"::1\" && \"\$RH\" != \"localhost\" ]]; then \
-          GP=\$(grep -iE \"^\\s*GatewayPorts\\s+\" \"\$CFG\" | tail -n1 | awk \"{print tolower(\\\$2)}\"); \
-          [[ \"\$GP\" = \"yes\" ]] || { echo \"GatewayPorts is not yes (needed for non-local RHOST)\"; exit 22; }; \
-        fi; \
-      fi; \
-      exit 0 \
-    '\''" >> "\${LOGFILE}" 2>&1 || { echo "MODE=R preflight failed (forwarding settings)"; tail -n 120 "\${LOGFILE}" || true; exit 6; }; \
-fi'
-
-ExecStart=/usr/bin/autossh -M 0 -N \
-  -p \${PORT} \
-  -i "\${KEY}" \
+# Main tunnel
+ExecStart=/bin/bash -lc '/usr/bin/autossh -M 0 -N \
+  -p "${PORT}" \
+  -i "${KEY}" \
   -o BatchMode=yes \
   -o StrictHostKeyChecking=no \
-  -o UserKnownHostsFile="\${KNOWN}" \
+  -o UserKnownHostsFile="${KNOWN}" \
   -o PreferredAuthentications=publickey \
   -o PubkeyAuthentication=yes \
   -o PasswordAuthentication=no \
@@ -298,8 +259,12 @@ ExecStart=/usr/bin/autossh -M 0 -N \
   -o TCPKeepAlive=yes \
   -o ConnectTimeout=7 \
   -o ConnectionAttempts=1 \
-  ${FWD_ARG} \
-  \${USER}@\${IP} >> "\${LOGFILE}" 2>&1
+  '"'"'$(if [[ "${MODE}" = "L" ]]; then
+          echo "-L ${LHOST}:${LPORT}:${RHOST}:${RPORT}"
+        else
+          echo "-R ${RHOST}:${RPORT}:${LHOST}:${LPORT}"
+        fi)'"'"' \
+  "${USER}@${IP}" >> "${LOGFILE}" 2>&1'
 
 Restart=always
 RestartSec=2
@@ -315,17 +280,20 @@ EOF
 
 enable_start(){
   local START_TS
-  START_TS="$(date '+%Y-%m-%d %H:%M:%S')"
+  START_TS="$(date +'%Y-%m-%d %H:%M:%S')"
 
   systemctl daemon-reload
-  systemctl enable --now "${SERVICE}.service"
+  systemctl enable "${SERVICE}.service" >/dev/null 2>&1 || true
+
+  # IMPORTANT: always restart so new MODE/args apply
+  systemctl restart "${SERVICE}.service"
 
   echo
-  systemctl --no-pager --full status "${SERVICE}.service" | sed -n '1,22p' || true
+  systemctl --no-pager --full status "${SERVICE}.service" | sed -n '1,32p' || true
   echo
 
   if [[ "${MODE}" = "L" ]]; then
-    if ss -lntH "sport = :${LPORT}" | grep -q .; then
+    if command -v ss >/dev/null 2>&1 && ss -lntH "sport = :${LPORT}" | grep -q .; then
       ok "Tunnel is listening locally on ${LHOST}:${LPORT}"
     else
       warn "Tunnel may not be listening yet. Showing logs:"
@@ -334,8 +302,7 @@ enable_start(){
       exit 5
     fi
   else
-    # MODE=R: verify remote listener exists (retry; FIX#2 fallback)
-    # MODE=R: verify remote listener exists (retry to avoid false-negative)
+    # MODE=R: verify remote listener exists (retry)
     local i
     for i in 1 2 3 4 5; do
       if timeout 10 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
@@ -347,19 +314,17 @@ enable_start(){
         -o PasswordAuthentication=no \
         -o KbdInteractiveAuthentication=no \
         -o IdentitiesOnly=yes \
-        "bash -lc 'if command -v ss >/dev/null 2>&1; then ss -lntH \"sport = :${RPORT}\" | grep -q LISTEN; else netstat -lnt 2>/dev/null | awk \"{print \\$4}\" | grep -q \":${RPORT}\$\"; fi'" >/dev/null 2>&1; then
+        "command -v ss >/dev/null 2>&1 && ss -lntH \"sport = :${RPORT}\" | grep -q LISTEN" >/dev/null 2>&1; then
         ok "Tunnel is listening on remote OUTSIDE ${RHOST}:${RPORT}"
-        break
+        return 0
       fi
       sleep 2
     done
 
-    if [[ "${i}" -ge 5 ]]; then
-      warn "Tunnel may not be listening remotely yet. Showing logs:"
-      journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true
-      tail -n 120 "${LOGFILE}" 2>/dev/null || true
-      exit 5
-    fi
+    warn "Tunnel may not be listening remotely yet. Showing logs:"
+    journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true
+    tail -n 120 "${LOGFILE}" 2>/dev/null || true
+    exit 5
   fi
 }
 
