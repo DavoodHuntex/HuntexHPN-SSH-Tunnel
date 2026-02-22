@@ -1,21 +1,35 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ============================================================
-#  HUNTEX HPN-SSH-Tunnel (STABLE / LOW-ERROR edition)
-#  - Builds & installs HPN-SSH into: /usr/local/hpnssh
-#  - Runs hpnsshd on PORT (default 2222) as separate systemd service
-#  - Keeps system sshd on port 22 untouched
-#  - Uses PASSWORD + KBDINT auth by default (lowest error)
-#  - Raises limits (MaxStartups/NOFILE/backlog) for many tunnels
-# ============================================================
+: <<'TXT'
+============================================================
+
+HUNTEX HPN-SSH-Tunnel (STABLE / LOW-ERROR edition)
+
+Builds & installs HPN-SSH into: /usr/local/hpnssh
+
+Runs hpnsshd on PORT (default 2222) as separate systemd service
+
+Keeps system sshd on port 22 untouched
+
+Uses PASSWORD + KBDINT auth by default (lowest error)
+
+Raises limits (MaxStartups/NOFILE/backlog) for many tunnels
+
+============================================================
+TXT
 
 APP_NAME="HUNTEX-HPN-SSH-Tunnel"
 APP_VER="3.2.0-stable"
 
-# -----------------------
-# Defaults (override via env)
-# -----------------------
+: <<'TXT'
+---
+
+Defaults (override via env)
+
+---
+TXT
+
 PORT="${PORT:-2222}"
 SERVICE="${SERVICE:-hpnsshd}"
 PREFIX="${PREFIX:-/usr/local/hpnssh}"
@@ -25,47 +39,77 @@ LOGDIR="${LOGDIR:-/root/hpn-logs}"
 HPN_REPO="${HPN_REPO:-https://github.com/rapier1/hpn-ssh.git}"
 MAKE_JOBS="${MAKE_JOBS:-1}"
 
-# -----------------------
-# Auth defaults (lowest error)
-# -----------------------
+: <<'TXT'
+---
+
+Auth defaults (lowest error)
+
+---
+TXT
+
 PERMIT_ROOT_LOGIN="${PERMIT_ROOT_LOGIN:-yes}"
 PASSWORD_AUTH="${PASSWORD_AUTH:-yes}"
 KBDINT_AUTH="${KBDINT_AUTH:-yes}"   # keep this ON (your working case)
 
-# -----------------------
-# Reliability / Limits (raised)
-# -----------------------
+: <<'TXT'
+---
+
+Reliability / Limits (raised)
+
+---
+TXT
+
 USE_DNS="${USE_DNS:-no}"
 LOGIN_GRACE_TIME="${LOGIN_GRACE_TIME:-300}"
 MAX_AUTH_TRIES="${MAX_AUTH_TRIES:-50}"
 LOG_LEVEL="${LOG_LEVEL:-ERROR}"
 
-# IMPORTANT: reduce annoying drops during reconnect storms
-# (values are big on purpose)
+: <<'TXT'
+IMPORTANT: reduce annoying drops during reconnect storms
+(values are big on purpose)
+TXT
+
 MAX_STARTUPS="${MAX_STARTUPS:-2000:30:8000}"
 PER_SOURCE_MAX_STARTUPS="${PER_SOURCE_MAX_STARTUPS:-500}"
 PER_SOURCE_NETBLOCK_SIZE="${PER_SOURCE_NETBLOCK_SIZE:-32}"
 PER_SOURCE_PENALTIES="${PER_SOURCE_PENALTIES:-no}"
 
-# Keepalive (balanced)
+: <<'TXT'
+Keepalive (balanced)
+TXT
+
 CLIENT_ALIVE_INTERVAL="${CLIENT_ALIVE_INTERVAL:-30}"
 CLIENT_ALIVE_COUNTMAX="${CLIENT_ALIVE_COUNTMAX:-6}"
 
-# systemd limits
+: <<'TXT'
+systemd limits
+TXT
+
 LIMIT_NOFILE="${LIMIT_NOFILE:-1048576}"
 TASKS_MAX="${TASKS_MAX:-infinity}"
 
-# Optional: disable fail2ban/hosts.deny interference (security not important)
+: <<'TXT'
+Optional: disable fail2ban/hosts.deny interference (security not important)
+TXT
+
 DISABLE_FAIL2BAN="${DISABLE_FAIL2BAN:-1}"
 DISABLE_HOSTS_DENY="${DISABLE_HOSTS_DENY:-1}"
 
-# HPN + compatible ciphers (applied only if daemon accepts it)
+: <<'TXT'
+HPN + compatible ciphers (applied only if daemon accepts it)
+TXT
+
 CIPHERS_DEFAULT="chacha20-poly1305-mt@hpnssh.org,chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr,aes256-ctr"
 CIPHERS="${CIPHERS:-$CIPHERS_DEFAULT}"
 
-# -----------------------
-# Colors / UI
-# -----------------------
+: <<'TXT'
+---
+
+Colors / UI
+
+---
+TXT
+
 C_RESET=$'\033[0m'
 C_BOLD=$'\033[1m'
 C_DIM=$'\033[2m'
@@ -104,9 +148,14 @@ BANNER
   hr
 }
 
-# -----------------------
-# Logs
-# -----------------------
+: <<'TXT'
+---
+
+Logs
+
+---
+TXT
+
 APTLOG="$LOGDIR/apt.log"
 GITLOG="$LOGDIR/git.log"
 BLDLOG="$LOGDIR/build.log"
@@ -335,9 +384,14 @@ ensure_host_keys() {
   chmod 644 "$SYSCONFDIR"/ssh_host_*_key.pub 2>/dev/null || true
 }
 
-# -----------------------
-# Option probing (prevents "Unsupported option ..." errors)
-# -----------------------
+: <<'TXT'
+---
+
+Option probing (prevents "Unsupported option ..." errors)
+
+---
+TXT
+
 pick_test_hostkey() {
   local k=""
   for k in \
@@ -389,12 +443,17 @@ write_config() {
   ok "sftp-server -> ${SFTP_SERVER}"
 
   local auth_block misc_block cipher_line
+
+  # FIX 1: Do NOT emit UsePAM at all (you saw Unsupported option UsePAM)
+  # FIX 2: Do NOT force ChallengeResponseAuthentication no (can conflict with KbdInteractive)
+  # Optional overhead reductions: only if accepted by daemon
   auth_block="$(
     add_if_supported "$hpnsshd_bin" "PermitRootLogin ${PERMIT_ROOT_LOGIN}"
     add_if_supported "$hpnsshd_bin" "PasswordAuthentication ${PASSWORD_AUTH}"
     add_if_supported "$hpnsshd_bin" "KbdInteractiveAuthentication ${KBDINT_AUTH}"
-    add_if_supported "$hpnsshd_bin" "UsePAM no"
-    add_if_supported "$hpnsshd_bin" "ChallengeResponseAuthentication no"
+    add_if_supported "$hpnsshd_bin" "X11Forwarding no"
+    add_if_supported "$hpnsshd_bin" "AllowAgentForwarding no"
+    add_if_supported "$hpnsshd_bin" "PermitTunnel no"
   )"
 
   misc_block="$(
@@ -489,7 +548,6 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-  # limits override (NOFILE high, TasksMax infinity)
   mkdir -p "$ovr_dir"
   cat >"$ovr" <<EOF
 [Service]
