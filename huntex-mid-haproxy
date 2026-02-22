@@ -40,23 +40,34 @@ else
 fi
 
 _hr() { printf "%s\n" "${DIM}${SILVER}────────────────────────────────────────────────────────────${RESET}"; }
+
 _box() {
   local title="$1" subtitle="$2"
   title="${title:-"No Title"}"
   subtitle="${subtitle:-"No Subtitle"}"
 
+  # ✅ FIX: make padding safe (never negative)
+  local pad_title=$((58 - ${#title}))
+  local pad_sub=$((58 - ${#subtitle}))
+  (( pad_title < 0 )) && pad_title=0
+  (( pad_sub < 0 )) && pad_sub=0
+
   _hr
   printf "%s┌──────────────────────────────────────────────────────────┐%s\n" "${DIM}${SILVER}" "${RESET}"
-  printf "%s│%s %s%s%s%*s%s│%s\n" \
+
+  # ✅ FIX: printf format matches passed args (no %s%s%s mismatch)
+  printf "%s│%s %s%*s %s│%s\n" \
     "${DIM}${SILVER}" "${RESET}" \
     "${BOLD}${MUSTARD}${title}${RESET}" \
-    "$((58 - ${#title}))" "" \
+    "${pad_title}" "" \
     "${DIM}${SILVER}" "${RESET}"
-  printf "%s│%s %s%s%*s%s│%s\n" \
+
+  printf "%s│%s %s%*s %s│%s\n" \
     "${DIM}${SILVER}" "${RESET}" \
     "${DIM}${SILVER}${subtitle}${RESET}" \
-    "$((58 - ${#subtitle}))" "" \
+    "${pad_sub}" "" \
     "${DIM}${SILVER}" "${RESET}"
+
   printf "%s└──────────────────────────────────────────────────────────┘%s\n" "${DIM}${SILVER}" "${RESET}"
   _hr
 }
@@ -265,7 +276,6 @@ main() {
   is_ipv4 "$OUT_IP"  || die "OUT_IP looks invalid: $OUT_IP"
   is_port "$PORT"    || die "PORT invalid/out of range: $PORT"
 
-  # ✅ FIX: proper BIND_ADDR validation (NO function call inside [[ ... ]])
   if [[ "$BIND_ADDR" == "0.0.0.0" || "$BIND_ADDR" == "127.0.0.1" ]] || is_ipv4 "$BIND_ADDR"; then
     : # ok
   else
