@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# allow: bash script.sh IP=... PORT=...
 for _arg in "$@"; do
   [[ "$_arg" == *=* ]] || continue
+  # shellcheck disable=SC2163
   export "$_arg"
 done
 
@@ -11,6 +13,7 @@ _have_tput() { command -v tput >/dev/null 2>&1; }
 
 _full_reset_screen() {
   _have_tty || return 0
+  # reset + clear + wipe scrollback
   printf '\e[0m\e[H\e[2J\e[3J' || true
   if _have_tput; then
     tput sgr0 >/dev/null 2>&1 || true
@@ -19,14 +22,17 @@ _full_reset_screen() {
   fi
 }
 
+# Colors (Silver + Mustard inspired)
 if _have_tty && _have_tput; then
   SILVER="$(tput setaf 7)"
   MUSTARD="$(tput setaf 3)"
   DIM="$(tput dim)"
   BOLD="$(tput bold)"
   RESET="$(tput sgr0)"
+  REDC="$(tput setaf 1)"
 else
   SILVER=""; MUSTARD=""; DIM=""; BOLD=""; RESET=""
+  REDC=$'\e[31m'
 fi
 
 _hr() { printf "%s\n" "${DIM}${SILVER}────────────────────────────────────────────────────────────${RESET}"; }
@@ -55,7 +61,7 @@ _box() {
 }
 
 phase() { printf "%s▶%s %s%s%s\n" "${DIM}${SILVER}" "${RESET}" "${BOLD}${MUSTARD}" "$*" "${RESET}"; }
-ok()    { printf "%s✅%s %s\n" "${BOLD}${MUSTARD}" "${RESET}" "$*"; }
+ok()    { printf "%s✅%s  %s\n" "${BOLD}${MUSTARD}" "${RESET}" "$*"; }
 warn()  { printf "%s⚠️ %s%s\n" "${BOLD}${MUSTARD}" "$*" "${RESET}" >&2; }
 die()   { printf "%s❌%s %s\n" "${BOLD}${MUSTARD}" "${RESET}" "$*" >&2; exit 1; }
 
@@ -159,6 +165,8 @@ EOF
 }
 
 write_unit(){
+  # IMPORTANT: use ENV variables at runtime (ExecStartPre/ExecStart),
+  # do NOT expand them here (avoid quoting hell)
   cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=HUNTEX AutoSSH Tunnel (${SERVICE})
@@ -173,21 +181,21 @@ EnvironmentFile=${ENV_FILE}
 Environment=AUTOSSH_GATETIME=0
 
 ExecStartPre=/usr/bin/install -d -m 700 /root/.ssh
-ExecStartPre=/usr/bin/install -m 600 /dev/null ${LOGFILE}
+ExecStartPre=/usr/bin/install -m 600 /dev/null \${LOGFILE}
 ExecStartPre=/usr/bin/rm -f \${KNOWN}
-ExecStartPre=/usr/bin/ssh-keyscan -p \${PORT} -H \${IP} > \${KNOWN}
+ExecStartPre=/bin/bash -lc '/usr/bin/ssh-keyscan -p "\${PORT}" -H "\${IP}" > "\${KNOWN}" 2>>"\${LOGFILE}"'
 ExecStartPre=/usr/bin/chmod 600 \${KNOWN}
 ExecStartPre=/usr/bin/test -f \${KEY}
 
-StandardOutput=append:${LOGFILE}
-StandardError=append:${LOGFILE}
+StandardOutput=append:\${LOGFILE}
+StandardError=append:\${LOGFILE}
 
 ExecStart=/usr/bin/autossh -M 0 -N \\
-  -p \${PORT} \\
-  -i \${KEY} \\
-  -L \${LHOST}:\${LPORT}:\${RHOST}:\${RPORT} \\
+  -p "\${PORT}" \\
+  -i "\${KEY}" \\
+  -L "\${LHOST}:\${LPORT}:\${RHOST}:\${RPORT}" \\
   -o StrictHostKeyChecking=no \\
-  -o UserKnownHostsFile=\${KNOWN} \\
+  -o UserKnownHostsFile="\${KNOWN}" \\
   -o PreferredAuthentications=publickey \\
   -o PubkeyAuthentication=yes \\
   -o PasswordAuthentication=no \\
@@ -200,7 +208,7 @@ ExecStart=/usr/bin/autossh -M 0 -N \\
   -o ConnectTimeout=7 \\
   -o ConnectionAttempts=1 \\
   -o LogLevel=ERROR \\
-  \${USER}@\${IP}
+  "\${USER}@\${IP}"
 
 Restart=always
 RestartSec=2
@@ -217,7 +225,8 @@ _is_listening_local(){
 }
 
 _fail_minimal(){
-  printf "%s❌%s  FAILED\n" "${BOLD}${MUSTARD}" "${RESET}"
+  # bold + red
+  printf "%s%s❌  FAILED%s\n" "${BOLD}" "${REDC}" "${RESET}"
   echo "check: systemctl --no-pager -l status ${SERVICE}.service | sed -n '1,80p'"
   echo "logs : journalctl -u ${SERVICE}.service -n 120 --no-pager"
   echo "file : tail -n 120 ${LOGFILE}"
@@ -232,6 +241,7 @@ enable_start_and_verify(){
   sleep 1
   systemctl is-active --quiet "${SERVICE}.service" || _fail_minimal
   _is_listening_local || _fail_minimal
+
   printf "%s✅%s  OK  %s%s:%s%s → %s%s:%s%s  via  %s%s@%s:%s%s\n" \
     "${BOLD}${MUSTARD}" "${RESET}" \
     "${SILVER}" "${LHOST}" "${MUSTARD}" "${LPORT}" \
