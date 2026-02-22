@@ -6,26 +6,28 @@ set -Eeuo pipefail
 #  Client → IRAN:PORT → (SSH) → MID:PORT → OUT:PORT → Xray
 #
 #  Usage (GitHub RAW):
-#    curl -fsSL https://raw.githubusercontent.com/<YOU>/Huntex-mid-haproxy/main/mid-install.sh | \
-#      OUT_IP="X.X.X.X" PORT="443" bash
+#    curl -fsSL https://raw.githubusercontent.com/DavoodHuntex/HuntexHPN-SSH-Tunnel/main/huntex-mid-haproxy | \
+#      OUT_IP="X.X.X.X" PORT="443" BIND_ADDR="127.0.0.1" bash
 #
 #  Required env:
 #    OUT_IP   : OUT server IP (panel/xray)
 #    PORT     : same port for listen + forward (e.g. 443 or 2053)
 #
 #  Optional env:
-#    BIND_ADDR  : default 0.0.0.0
+#    BIND_ADDR  : default 0.0.0.0  (recommended: 127.0.0.1 for your tunnel design)
 # ============================================================
 
 # -------------------- UI (Silver + Mustard) --------------------
 _have_tty()  { [[ -t 1 ]]; }
 _have_tput() { command -v tput >/dev/null 2>&1; }
 
-# Full terminal reset (not clear)
+# Full terminal reset (NOT clear) + clear scrollback (best-effort)
 _full_reset_screen() {
-  # only if running in a real terminal
   if _have_tty; then
-    printf '\033c'
+    # Full reset
+    printf '\033c' || true
+    # Clear screen + scrollback buffer (best-effort)
+    printf '\033[3J\033[H\033[2J' || true
   fi
 }
 
@@ -40,31 +42,33 @@ else
 fi
 
 _hr() { printf "%s\n" "${DIM}${SILVER}────────────────────────────────────────────────────────────${RESET}"; }
-_box() {
-  local title="$1" subtitle="$2"
-  title="${title:-"No Title"}"
-  subtitle="${subtitle:-"No Subtitle"}"
 
-  # ✅ FIX: make padding safe (never negative)
-  local pad_title=$((58 - ${#title}))
-  local pad_sub=$((58 - ${#subtitle}))
-  (( pad_title < 0 )) && pad_title=0
-  (( pad_sub < 0 )) && pad_sub=0
+_pad() {
+  # _pad <width> <text>
+  local width="$1" text="$2"
+  local n=$(( width - ${#text} ))
+  (( n < 0 )) && n=0
+  printf "%*s" "$n" ""
+}
+
+_box() {
+  local title="${1:-No Title}"
+  local subtitle="${2:-No Subtitle}"
+  local inner=58
 
   _hr
   printf "%s┌──────────────────────────────────────────────────────────┐%s\n" "${DIM}${SILVER}" "${RESET}"
 
-  # ✅ FIX: printf format matches passed args (no %s%s%s mismatch)
-  printf "%s│%s %s%*s %s│%s\n" \
+  printf "%s│%s %s%s%s%s %s│%s\n" \
     "${DIM}${SILVER}" "${RESET}" \
-    "${BOLD}${MUSTARD}${title}${RESET}" \
-    "${pad_title}" "" \
+    "${BOLD}${MUSTARD}" "${title}" "${RESET}" \
+    "$(_pad "$inner" "$title")" \
     "${DIM}${SILVER}" "${RESET}"
 
-  printf "%s│%s %s%*s %s│%s\n" \
+  printf "%s│%s %s%s%s %s│%s\n" \
     "${DIM}${SILVER}" "${RESET}" \
-    "${DIM}${SILVER}${subtitle}${RESET}" \
-    "${pad_sub}" "" \
+    "${DIM}${SILVER}" "${subtitle}" "${RESET}" \
+    "$(_pad "$inner" "$subtitle")" \
     "${DIM}${SILVER}" "${RESET}"
 
   printf "%s└──────────────────────────────────────────────────────────┘%s\n" "${DIM}${SILVER}" "${RESET}"
@@ -76,9 +80,7 @@ warn() { printf "%s⚠️ %s%s\n" "${BOLD}${MUSTARD}" "$*" "${RESET}" >&2; }
 err()  { printf "%s❌ %s%s\n" "${BOLD}${MUSTARD}" "$*" "${RESET}" >&2; }
 die()  { err "$*"; exit 1; }
 
-phase() {
-  printf "%s%s▶%s %s%s%s\n" "${DIM}${SILVER}" "" "${RESET}" "${BOLD}${MUSTARD}" "$*" "${RESET}"
-}
+phase() { printf "%s▶%s %s%s%s\n" "${DIM}${SILVER}" "${RESET}" "${BOLD}${MUSTARD}" "$*" "${RESET}"; }
 
 need_root() { [[ "${EUID:-0}" -eq 0 ]] || die "Run as root (sudo)."; }
 
@@ -95,8 +97,8 @@ OVR_DIR="/etc/systemd/system/haproxy.service.d"
 OVR="${OVR_DIR}/override.conf"
 
 # -------------------- Helpers --------------------
-is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
-is_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 )); }
+is_ipv4() { [[ "${1:-}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+is_port() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 1 <= 10#${1} && 10#${1} <= 65535 )); }
 
 get_nproc() {
   local n
@@ -122,6 +124,23 @@ get_ulimit_nofile() {
   echo "$n"
 }
 
+# Conservative safe heuristics:
+calc_target_nofile() {
+  local current="$1"
+  local target="$current"
+  (( target < 65535 )) && target=65535
+  (( target > 1048576 )) && target=1048576
+  echo "$target"
+}
+
+calc_nbthread() {
+  local CPU_COUNT="$1"
+  local nb="$CPU_COUNT"
+  (( nb < 1 )) && nb=1
+  (( nb > 8 )) && nb=8
+  echo "$nb"
+}
+
 calc_maxconn() {
   local target_nofile="$1" mem_mib="$2"
   local fd_budget maxconn_fd maxconn_ram maxconn
@@ -135,29 +154,13 @@ calc_maxconn() {
   (( maxconn > maxconn_ram )) && maxconn="$maxconn_ram"
   (( maxconn > 200000 )) && maxconn=200000
   (( maxconn < 2000 )) && maxconn=2000
-
   echo "$maxconn"
 }
 
-calc_nbthread() {
-  local cpu="$1" nb="$cpu"
-  (( nb < 1 )) && nb=1
-  (( nb > 8 )) && nb=8
-  echo "$nb"
-}
-
-calc_target_nofile() {
-  local current="$1"
-  local target="$current"
-  (( target < 65535 )) && target=65535
-  (( target > 1048576 )) && target=1048576
-  echo "$target"
-}
-
 build_cpu_map_line() {
-  local nbthread="$1" cpu="$2"
-  local map_n="$nbthread"
-  (( map_n > cpu )) && map_n="$cpu"
+  local NBTHREAD="$1" CPU_COUNT="$2"
+  local map_n="$NBTHREAD"
+  (( map_n > CPU_COUNT )) && map_n="$CPU_COUNT"
   if (( map_n >= 1 )); then
     echo "    cpu-map 1/1-${map_n} 0-$((map_n-1))"
   else
@@ -173,7 +176,7 @@ install_pkgs() {
 }
 
 backup_cfg() {
-  mkdir -p "$CFG_Bak_DIR"
+  mkdir -p "$CFG_BAK_DIR"
   if [[ -f "$CFG" ]]; then
     cp -a "$CFG" "$CFG_BAK_DIR/haproxy.cfg.$(date +%s).bak" || true
   fi
@@ -255,7 +258,11 @@ EOF
 }
 
 validate_cfg() { haproxy -c -f "$CFG" >/dev/null 2>&1; }
-start_haproxy() { systemctl enable haproxy >/dev/null 2>&1 || true; systemctl restart haproxy; }
+
+start_haproxy() {
+  systemctl enable haproxy >/dev/null 2>&1 || true
+  systemctl restart haproxy
+}
 
 verify_listen() {
   if ss -lntp 2>/dev/null | grep -qE ":${PORT}\b"; then
@@ -276,14 +283,14 @@ main() {
   is_port "$PORT"    || die "PORT invalid/out of range: $PORT"
 
   if [[ "$BIND_ADDR" == "0.0.0.0" || "$BIND_ADDR" == "127.0.0.1" ]] || is_ipv4 "$BIND_ADDR"; then
-    : # ok
+    :
   else
     die "BIND_ADDR invalid: $BIND_ADDR"
   fi
 
   _box "HUNTEX MID HAProxy" "PASS-THROUGH + AutoTune (Silver + Mustard)"
-  printf "%s%s• OUT:%s %s:%s\n" "${SILVER}${DIM}" "" "${RESET}" "${SILVER}${OUT_IP}${RESET}" "${MUSTARD}${PORT}${RESET}"
-  printf "%s%s• MID bind:%s %s:%s\n" "${SILVER}${DIM}" "" "${RESET}" "${SILVER}${BIND_ADDR}${RESET}" "${MUSTARD}${PORT}${RESET}"
+  printf "%s• OUT:%s %s:%s\n" "${SILVER}${DIM}" "${RESET}" "${SILVER}${OUT_IP}${RESET}" "${MUSTARD}${PORT}${RESET}"
+  printf "%s• MID bind:%s %s:%s\n" "${SILVER}${DIM}" "${RESET}" "${SILVER}${BIND_ADDR}${RESET}" "${MUSTARD}${PORT}${RESET}"
   _hr
 
   phase "Phase 0 — Packages"
@@ -343,8 +350,8 @@ main() {
 
   _hr
   ok "DONE — MID pass-through is ready"
-  printf "%s%sClient → IRAN:%s → (SSH) → MID:%s → OUT:%s → Xray%s\n" \
-    "${SILVER}${DIM}" "" "${PORT}" "${PORT}" "${PORT}" "${RESET}"
+  printf "%sClient → IRAN:%s → (SSH) → MID:%s → OUT:%s → Xray%s\n" \
+    "${SILVER}${DIM}" "${PORT}" "${PORT}" "${PORT}" "${RESET}"
   _hr
   echo "Useful:"
   echo "  cat /etc/haproxy/haproxy.cfg"
