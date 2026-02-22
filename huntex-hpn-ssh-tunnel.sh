@@ -7,20 +7,16 @@ set -Eeuo pipefail
 HUNTEX HPN-SSH-Tunnel (STABLE / LOW-ERROR edition)
 
 Builds & installs HPN-SSH into: /usr/local/hpnssh
-
 Runs hpnsshd on PORT (default 2222) as separate systemd service
-
 Keeps system sshd on port 22 untouched
-
 Uses PASSWORD + KBDINT auth by default (lowest error)
-
 Raises limits (MaxStartups/NOFILE/backlog) for many tunnels
 
 ============================================================
 TXT
 
 APP_NAME="HUNTEX-HPN-SSH-Tunnel"
-APP_VER="3.2.0-stable"
+APP_VER="3.2.1-stable"   # bumped (same logic, just fixes)
 
 : <<'TXT'
 ---
@@ -60,17 +56,24 @@ Reliability / Limits (raised)
 TXT
 
 USE_DNS="${USE_DNS:-no}"
-LOGIN_GRACE_TIME="${LOGIN_GRACE_TIME:-300}"
-MAX_AUTH_TRIES="${MAX_AUTH_TRIES:-50}"
+
+# IMPORTANT: these defaults are now SAFE for 2c/4GB under reconnect storms
+# You can override via env if you want.
+LOGIN_GRACE_TIME="${LOGIN_GRACE_TIME:-60}"   # was 300
+MAX_AUTH_TRIES="${MAX_AUTH_TRIES:-10}"       # was 50
 LOG_LEVEL="${LOG_LEVEL:-ERROR}"
 
 : <<'TXT'
 IMPORTANT: reduce annoying drops during reconnect storms
-(values are big on purpose)
+(values are now "safe-high" not "crazy-high")
 TXT
 
-MAX_STARTUPS="${MAX_STARTUPS:-2000:30:8000}"
-PER_SOURCE_MAX_STARTUPS="${PER_SOURCE_MAX_STARTUPS:-500}"
+# was 2000:30:8000 -> can explode RAM/CPU under storms
+MAX_STARTUPS="${MAX_STARTUPS:-200:30:800}"
+
+# was 500 -> per-source storms eat the box alive
+PER_SOURCE_MAX_STARTUPS="${PER_SOURCE_MAX_STARTUPS:-30}"
+
 PER_SOURCE_NETBLOCK_SIZE="${PER_SOURCE_NETBLOCK_SIZE:-32}"
 PER_SOURCE_PENALTIES="${PER_SOURCE_PENALTIES:-no}"
 
@@ -444,13 +447,15 @@ write_config() {
 
   local auth_block misc_block cipher_line
 
-  # FIX 1: Do NOT emit UsePAM at all (you saw Unsupported option UsePAM)
-  # FIX 2: Do NOT force ChallengeResponseAuthentication no (can conflict with KbdInteractive)
-  # Optional overhead reductions: only if accepted by daemon
+  # OPT: low-overhead knobs (only if daemon accepts)
+  # FIX: Do NOT emit UsePAM at all (some HPN builds don't support it)
   auth_block="$(
     add_if_supported "$hpnsshd_bin" "PermitRootLogin ${PERMIT_ROOT_LOGIN}"
     add_if_supported "$hpnsshd_bin" "PasswordAuthentication ${PASSWORD_AUTH}"
     add_if_supported "$hpnsshd_bin" "KbdInteractiveAuthentication ${KBDINT_AUTH}"
+
+    add_if_supported "$hpnsshd_bin" "GSSAPIAuthentication no"
+    add_if_supported "$hpnsshd_bin" "KerberosAuthentication no"
     add_if_supported "$hpnsshd_bin" "X11Forwarding no"
     add_if_supported "$hpnsshd_bin" "AllowAgentForwarding no"
     add_if_supported "$hpnsshd_bin" "PermitTunnel no"
@@ -462,7 +467,6 @@ write_config() {
     add_if_supported "$hpnsshd_bin" "MaxAuthTries ${MAX_AUTH_TRIES}"
     add_if_supported "$hpnsshd_bin" "LogLevel ${LOG_LEVEL}"
 
-    # BIG limits for many autossh reconnect storms:
     add_if_supported "$hpnsshd_bin" "MaxStartups ${MAX_STARTUPS}"
     add_if_supported "$hpnsshd_bin" "PerSourceMaxStartups ${PER_SOURCE_MAX_STARTUPS}"
     add_if_supported "$hpnsshd_bin" "PerSourceNetBlockSize ${PER_SOURCE_NETBLOCK_SIZE}"
@@ -510,8 +514,11 @@ GatewayPorts yes
 Subsystem sftp ${SFTP_SERVER}
 EOF
 
+  # hard cleanup: if someone previously had UsePAM in this file, remove it
+  sed -i '/^\s*UsePAM\s\+/Id' "$cfg" 2>/dev/null || true
+
   if ! "$hpnsshd_bin" -t -f "$cfg" >/dev/null 2>&1; then
-    warn "Config test failed (should not happen). Error:"
+    warn "Config test failed. Error:"
     "$hpnsshd_bin" -t -f "$cfg" 2>&1 | tail -n 120 || true
     die "hpnsshd config invalid."
   fi
@@ -570,7 +577,6 @@ cleanup_existing_unit() {
 
 start_service() {
   _stage "Service"
-  cleanup_existing_unit
   _run_stage "enable+start" "$SVCLOG" "systemctl enable --now '${SERVICE}.service'"
 
   echo
@@ -580,6 +586,30 @@ start_service() {
   echo
   ok "Last logs:"
   journalctl -u "${SERVICE}.service" --no-pager -n 40 || true
+}
+
+restart_only_cmd() {
+  banner
+  _stage "Restart-only (no rebuild)"
+  local hpnsshd_bin
+  hpnsshd_bin="$(locate_hpnsshd)"
+  ok "Using daemon: ${hpnsshd_bin}"
+
+  ensure_privsep_user
+  ensure_host_keys
+
+  HPNSSHD_BIN="$hpnsshd_bin"
+  write_config
+  write_systemd_unit "$hpnsshd_bin"
+
+  _run_stage "restart" "$SVCLOG" "systemctl restart '${SERVICE}.service'"
+  ok "Restarted ${SERVICE} successfully"
+  echo
+  ok "Ports:"
+  ss -lntp | grep -E ":(22|${PORT})\b" || true
+  echo
+  ok "UsePAM check:"
+  grep -n 'UsePAM' "${SYSCONFDIR}/hpnsshd_config" >/dev/null 2>&1 && warn "UsePAM still present (unexpected)" || ok "UsePAM: REMOVED ✅"
 }
 
 status_cmd() {
@@ -592,6 +622,9 @@ status_cmd() {
   echo
   ok "Limits:"
   systemctl show "${SERVICE}.service" -p LimitNOFILE -p TasksMax || true
+  echo
+  ok "Config pressure knobs:"
+  grep -nE 'MaxStartups|PerSourceMaxStartups|LoginGraceTime|MaxAuthTries' "${SYSCONFDIR}/hpnsshd_config" 2>/dev/null || true
 }
 
 logs_cmd() {
@@ -631,6 +664,13 @@ install_cmd() {
   disable_fail2ban_hostsdeny_best_effort
   apply_sysctl_tuning
 
+  # If already installed, do restart-only (fast path)
+  if [[ -x "${PREFIX}/sbin/hpnsshd" ]]; then
+    warn "HPN-SSH already installed -> applying config + restarting (no rebuild)"
+    restart_only_cmd
+    return 0
+  fi
+
   install_deps
   clone_build_install
 
@@ -654,7 +694,7 @@ install_cmd() {
   ok "Low-error behavior enabled:"
   ok "  - PasswordAuthentication yes"
   ok "  - KbdInteractiveAuthentication yes"
-  ok "  - High MaxStartups / PerSourceMaxStartups / LoginGraceTime"
+  ok "  - SAFE MaxStartups / PerSourceMaxStartups / LoginGraceTime / MaxAuthTries"
   ok "  - LimitNOFILE=${LIMIT_NOFILE}"
   echo
   echo -e "${C_GRAY}Useful:${C_RESET}"
@@ -669,6 +709,7 @@ usage() {
   cat <<USAGE
 Usage:
   sudo ./${0##*/} install
+  sudo ./${0##*/} restart
   sudo ./${0##*/} status
   sudo ./${0##*/} logs
   sudo ./${0##*/} uninstall
@@ -676,24 +717,16 @@ Usage:
 Env overrides (main):
   PORT=2222 SERVICE=hpnsshd PREFIX=/usr/local/hpnssh SYSCONFDIR=/etc/hpnssh MAKE_JOBS=1
   PASSWORD_AUTH=yes KBDINT_AUTH=yes PERMIT_ROOT_LOGIN=yes
-  LOGIN_GRACE_TIME=300 MAX_AUTH_TRIES=50 LOG_LEVEL=ERROR
-  MAX_STARTUPS="2000:30:8000" PER_SOURCE_MAX_STARTUPS=500
+
+  # pressure knobs (override if you insist)
+  LOGIN_GRACE_TIME=60 MAX_AUTH_TRIES=10 LOG_LEVEL=ERROR
+  MAX_STARTUPS="200:30:800" PER_SOURCE_MAX_STARTUPS=30
+  PER_SOURCE_NETBLOCK_SIZE=32 PER_SOURCE_PENALTIES=no
+
   LIMIT_NOFILE=1048576 TASKS_MAX=infinity
   DISABLE_FAIL2BAN=1 DISABLE_HOSTS_DENY=1
 USAGE
 }
 
 main() {
-  local cmd="${1:-}"
-  case "$cmd" in
-    install)   install_cmd ;;
-    status)    status_cmd ;;
-    logs)      logs_cmd ;;
-    uninstall) uninstall_cmd ;;
-    ""|-h|--help|help) usage ;;
-    *) die "Unknown command: $cmd (use: install/status/logs/uninstall)" ;;
-  esac
-}
-
-need_root
-main "$@"
+  local cmd="${
