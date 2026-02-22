@@ -58,10 +58,10 @@ info "Writing: ${BOLD}${CONF}${RESET}"
 cat > "${CONF}" <<'SYS'
 # =============================
 # HUNTEX FINAL OPTIMIZER
-# Safe sysctl for tunnel-heavy setups (AutoSSH/WG/NAT)
+# Safe sysctl for tunnel-heavy setups (AutoSSH/WG/NAT/HAProxy)
 # =============================
 
-# --- Queueing + Congestion Control ---
+# --- Queueing + Congestion Control (safe + widely beneficial) ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
@@ -81,23 +81,24 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_fin_timeout = 15
 
-# --- Backlogs / bursts ---
-net.core.somaxconn = 4096
-net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_max_syn_backlog = 8192
+# --- Backlogs / bursts (SAFE-HIGH: helps under load; avoids MID regressions) ---
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# --- Ports (avoid ephemeral exhaustion on bursty tunnels) ---
+net.ipv4.ip_local_port_range = 10240 65535
 
 # --- Low-risk TCP options ---
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_fastopen = 3
 
-# --- Routing for NAT / WireGuard ---
-net.ipv4.ip_forward = 1
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
+# Fast Open: safer as client-only (3 can misbehave on some paths)
+net.ipv4.tcp_fastopen = 1
 
 # --- Conntrack (effective only if nf_conntrack is loaded) ---
+# (actual max is set conditionally in Phase 2 when NAT/WG is detected)
 net.netfilter.nf_conntrack_max = 262144
 SYS
 
@@ -107,17 +108,37 @@ run "sysctl --system >/dev/null 2>&1 || true"
 ok "sysctl applied"
 hr
 
-step "Phase 2 — Conntrack (NAT capacity)"
-info "Loading module: ${BOLD}nf_conntrack${RESET} (best-effort)"
-run "modprobe nf_conntrack >/dev/null 2>&1 || true"
-run "mkdir -p /etc/modules-load.d && echo nf_conntrack > /etc/modules-load.d/nf_conntrack.conf"
+step "Phase 2 — Conntrack / Forwarding (only when needed, no surprise changes)"
+# Detect NAT/WG need (best-effort):
+# - wg interface exists OR
+# - iptables has MASQUERADE rule OR
+# - ip_forward already enabled by admin
+WG_DETECTED="NO"
+NAT_DETECTED="NO"
+FWD_CURRENT="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)"
 
-# if key exists now, set it explicitly
-if sysctl -n net.netfilter.nf_conntrack_max >/dev/null 2>&1; then
-  run "sysctl -w net.netfilter.nf_conntrack_max=262144 >/dev/null 2>&1 || true"
-  ok "conntrack ready"
+if ip link show wg0 >/dev/null 2>&1; then WG_DETECTED="YES"; fi
+if iptables -t nat -S 2>/dev/null | grep -q "MASQUERADE"; then NAT_DETECTED="YES"; fi
+
+if [[ "${WG_DETECTED}" == "YES" || "${NAT_DETECTED}" == "YES" || "${FWD_CURRENT}" == "1" ]]; then
+  info "NAT/WG detected (wg0=${WG_DETECTED}, nat=${NAT_DETECTED}, ip_forward=${FWD_CURRENT})"
+  info "Enabling: ${BOLD}ip_forward + rp_filter loose${RESET} (safe for tunnels/NAT)"
+  run "sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true"
+  run "sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true"
+  run "sysctl -w net.ipv4.conf.default.rp_filter=2 >/dev/null 2>&1 || true"
+
+  info "Loading module: ${BOLD}nf_conntrack${RESET} (best-effort)"
+  run "modprobe nf_conntrack >/dev/null 2>&1 || true"
+  run "mkdir -p /etc/modules-load.d && echo nf_conntrack > /etc/modules-load.d/nf_conntrack.conf"
+
+  if sysctl -n net.netfilter.nf_conntrack_max >/dev/null 2>&1; then
+    run "sysctl -w net.netfilter.nf_conntrack_max=262144 >/dev/null 2>&1 || true"
+    ok "conntrack ready"
+  else
+    warn "conntrack sysctl not available (kernel/module limitations)"
+  fi
 else
-  warn "conntrack sysctl not available (kernel/module limitations)"
+  ok "No NAT/WG detected → skipping ip_forward/rp_filter/conntrack (no side-effects)"
 fi
 hr
 
