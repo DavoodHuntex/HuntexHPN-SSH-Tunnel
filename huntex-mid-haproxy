@@ -21,6 +21,14 @@ set -Eeuo pipefail
 _have_tty()  { [[ -t 1 ]]; }
 _have_tput() { command -v tput >/dev/null 2>&1; }
 
+# Full terminal reset (not clear)
+_full_reset_screen() {
+  # only if running in a real terminal
+  if _have_tty; then
+    printf '\033c'
+  fi
+}
+
 if _have_tty && _have_tput; then
   SILVER="$(tput setaf 7)"     # silver/white
   MUSTARD="$(tput setaf 3)"    # mustard/yellow-ish
@@ -101,16 +109,14 @@ get_ulimit_nofile() {
   echo "$n"
 }
 
-# Conservative, safe heuristics for maxconn:
-# - Bound by FD budget and RAM, cap hard to 200k (safe for small/medium MID)
 calc_maxconn() {
   local target_nofile="$1" mem_mib="$2"
   local fd_budget maxconn_fd maxconn_ram maxconn
 
   fd_budget=$(( target_nofile - 2048 ))
   (( fd_budget < 2000 )) && fd_budget=2000
-  maxconn_fd=$(( fd_budget / 2 ))           # ~2 FDs per conn (very rough but safe-ish)
-  maxconn_ram=$(( mem_mib * 20 ))           # conservative RAM cap
+  maxconn_fd=$(( fd_budget / 2 ))
+  maxconn_ram=$(( mem_mib * 20 ))
 
   maxconn="$maxconn_fd"
   (( maxconn > maxconn_ram )) && maxconn="$maxconn_ram"
@@ -120,7 +126,6 @@ calc_maxconn() {
   echo "$maxconn"
 }
 
-# nbthread: follow CPU, but cap to 8 (safe default) unless you want more later.
 calc_nbthread() {
   local cpu="$1" nb="$cpu"
   (( nb < 1 )) && nb=1
@@ -128,7 +133,6 @@ calc_nbthread() {
   echo "$nb"
 }
 
-# Decide a good LimitNOFILE:
 calc_target_nofile() {
   local current="$1"
   local target="$current"
@@ -137,13 +141,11 @@ calc_target_nofile() {
   echo "$target"
 }
 
-# Best-effort cpu-map line (only if supported). We'll validate and fallback automatically.
 build_cpu_map_line() {
   local nbthread="$1" cpu="$2"
   local map_n="$nbthread"
   (( map_n > cpu )) && map_n="$cpu"
   if (( map_n >= 1 )); then
-    # Older haproxy versions may not like some syntaxes; we will validate and auto-disable if needed.
     echo "    cpu-map 1/1-${map_n} 0-$((map_n-1))"
   else
     echo ""
@@ -194,7 +196,6 @@ EOF
 }
 
 port_conflict_check() {
-  # If something is already bound on BIND_ADDR:PORT, warn (haproxy will fail anyway)
   if command -v ss >/dev/null 2>&1; then
     if ss -lntH "sport = :${PORT}" 2>/dev/null | grep -q .; then
       warn "Something is already LISTEN on :${PORT}. If it's not HAProxy, stop it first."
@@ -240,14 +241,8 @@ backend be_out
 EOF
 }
 
-validate_cfg() {
-  haproxy -c -f "$CFG" >/dev/null 2>&1
-}
-
-start_haproxy() {
-  systemctl enable haproxy >/dev/null 2>&1 || true
-  systemctl restart haproxy
-}
+validate_cfg() { haproxy -c -f "$CFG" >/dev/null 2>&1; }
+start_haproxy() { systemctl enable haproxy >/dev/null 2>&1 || true; systemctl restart haproxy; }
 
 verify_listen() {
   if ss -lntp 2>/dev/null | grep -qE ":${PORT}\b"; then
@@ -260,12 +255,19 @@ verify_listen() {
 # -------------------- main --------------------
 main() {
   need_root
+  _full_reset_screen
 
   [[ -n "$OUT_IP" ]] || die "OUT_IP is required. Example: OUT_IP=\"1.2.3.4\""
   [[ -n "$PORT"   ]] || die "PORT is required. Example: PORT=\"443\""
   is_ipv4 "$OUT_IP"  || die "OUT_IP looks invalid: $OUT_IP"
   is_port "$PORT"    || die "PORT invalid/out of range: $PORT"
-  [[ "$BIND_ADDR" == "0.0.0.0" || "$BIND_ADDR" == "127.0.0.1" || is_ipv4 "$BIND_ADDR" ]] || die "BIND_ADDR invalid: $BIND_ADDR"
+
+  # ✅ FIX: proper BIND_ADDR validation (NO function call inside [[ ... ]])
+  if [[ "$BIND_ADDR" == "0.0.0.0" || "$BIND_ADDR" == "127.0.0.1" ]] || is_ipv4 "$BIND_ADDR"; then
+    : # ok
+  else
+    die "BIND_ADDR invalid: $BIND_ADDR"
+  fi
 
   _box "HUNTEX MID HAProxy" "PASS-THROUGH + AutoTune (Silver + Mustard)"
   printf "%s%s• OUT:%s %s:%s\n" "${SILVER}${DIM}" "" "${RESET}" "${SILVER}${OUT_IP}${RESET}" "${MUSTARD}${PORT}${RESET}"
@@ -285,7 +287,6 @@ main() {
   NBTHREAD="$(calc_nbthread "$CPU")"
   MAXCONN="$(calc_maxconn "$TARGET_NOFILE" "$MEM_MIB")"
   CPU_MAP_LINE="$(build_cpu_map_line "$NBTHREAD" "$CPU")"
-
   ok "cpu=${CPU}, ram=${MEM_MIB}MiB, nbthread=${NBTHREAD}, maxconn=${MAXCONN}, nofile=${TARGET_NOFILE}"
 
   phase "Phase 2 — Safe kernel tuning (sysctl)"
@@ -301,7 +302,6 @@ main() {
   port_conflict_check
   write_cfg "$NBTHREAD" "$MAXCONN" "$CPU_MAP_LINE"
 
-  # Validate; if cpu-map syntax unsupported, auto-disable and re-validate.
   if ! validate_cfg; then
     warn "haproxy -c failed (likely cpu-map unsupported). Retrying without cpu-map…"
     write_cfg "$NBTHREAD" "$MAXCONN" ""
