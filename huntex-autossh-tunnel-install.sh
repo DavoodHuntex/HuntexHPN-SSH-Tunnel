@@ -12,6 +12,78 @@ set -Eeuo pipefail
 # - Fixes: old-log spam + unit escape errors + ensures restart applies new mode
 # ============================================================
 
+# -------------------- UI (Silver + Mustard) --------------------
+_have_tty()  { [[ -t 1 ]]; }
+_have_tput() { command -v tput >/dev/null 2>&1; }
+
+_full_reset_screen() {
+  if _have_tty; then
+    # Termius-friendly reset (avoid RIS \033c)
+    if _have_tput; then
+      tput sgr0 >/dev/null 2>&1 || true
+      tput reset >/dev/null 2>&1 || true
+    else
+      printf '\e[0m\e[H\e[2J'
+    fi
+    # wipe scrollback too
+    printf '\e[3J\e[H\e[2J'
+  fi
+}
+
+if _have_tty && _have_tput; then
+  SILVER="$(tput setaf 7)"
+  MUSTARD="$(tput setaf 3)"
+  DIM="$(tput dim)"
+  BOLD="$(tput bold)"
+  RESET="$(tput sgr0)"
+else
+  SILVER=""; MUSTARD=""; DIM=""; BOLD=""; RESET=""
+fi
+
+# Backward-compatible color vars (avoid unbound variable with -u)
+RED="${RED:-${MUSTARD}}"
+GREEN="${GREEN:-${MUSTARD}}"
+YELLOW="${YELLOW:-${MUSTARD}}"
+CYAN="${CYAN:-${SILVER}}"
+
+_hr() { printf "%s\n" "${DIM}${SILVER}────────────────────────────────────────────────────────────${RESET}"; }
+_pad() { printf '%*s' "$1" ''; }
+
+_box() {
+  local title="${1:-No Title}"
+  local subtitle="${2:-No Subtitle}"
+  local width=58
+
+  local tpad=$(( width - ${#title} ))
+  local spad=$(( width - ${#subtitle} ))
+  (( tpad < 0 )) && tpad=0
+  (( spad < 0 )) && spad=0
+
+  _hr
+  printf "%s┌──────────────────────────────────────────────────────────┐%s\n" "${DIM}${SILVER}" "${RESET}"
+  printf "%s│%s %s%s%s%s%s│%s\n" \
+    "${DIM}${SILVER}" "${RESET}" \
+    "${BOLD}${MUSTARD}${title}${RESET}" \
+    "$(_pad "$tpad")" \
+    "${DIM}${SILVER}" "${RESET}"
+  printf "%s│%s %s%s%s%s│%s\n" \
+    "${DIM}${SILVER}" "${RESET}" \
+    "${DIM}${SILVER}${subtitle}${RESET}" \
+    "$(_pad "$spad")" \
+    "${DIM}${SILVER}" "${RESET}"
+  printf "%s└──────────────────────────────────────────────────────────┘%s\n" "${DIM}${SILVER}" "${RESET}"
+  _hr
+}
+
+phase() { printf "%s▶%s %s%s%s\n" "${DIM}${SILVER}" "${RESET}" "${BOLD}${MUSTARD}" "$*" "${RESET}"; }
+ok()    { printf "%s✅%s %s\n" "${BOLD}${MUSTARD}" "${RESET}" "$*"; }
+warn()  { printf "%s⚠️ %s%s\n" "${BOLD}${MUSTARD}" "$*" "${RESET}" >&2; }
+die()   { printf "%s❌ %s%s\n" "${BOLD}${MUSTARD}" "$*" "${RESET}" >&2; exit 1; }
+log()   { printf "%s[%s] %s%s\n" "${DIM}${SILVER}" "$(date +'%F %T')" "${RESET}" "$*"; }
+
+need_root(){ [[ "${EUID:-0}" -eq 0 ]] || die "Run as root (sudo)."; }
+
+# -------------------- Original Script --------------------
 SERVICE="${SERVICE:-huntex-autossh-tunnel}"
 
 # Forward mode: L or R
@@ -42,13 +114,6 @@ ENV_FILE="/etc/default/${SERVICE}"
 UNIT_FILE="/etc/systemd/system/${SERVICE}.service"
 SETIP_BIN="/usr/local/bin/huntex-set-ip"
 LOGFILE="/var/log/${SERVICE}.log"
-
-die(){ echo -e "${RED}❌ $*${RESET}" >&2; exit 1; }
-ok(){ echo -e "${GREEN}✅ $*${RESET}"; }
-warn(){ echo -e "${YELLOW}⚠️  $*${RESET}" >&2; }
-log(){ echo -e "[$(date +'%F %T')] ${CYAN}$*${RESET}"; }
-
-need_root(){ [[ "${EUID:-0}" -eq 0 ]] || die "Run as root (sudo)."; }
 
 validate_mode(){
   case "${MODE}" in
@@ -107,75 +172,74 @@ set -Eeuo pipefail
 SERVICE="${SERVICE}"
 ENV_FILE="${ENV_FILE}"
 
-NEW_IP="${1:-}"
-if [[ -z "$NEW_IP" ]]; then
+NEW_IP="\${1:-}"
+if [[ -z "\$NEW_IP" ]]; then
   echo "Usage: huntex-set-ip NEW_IP"
   exit 1
 fi
 
-[[ -f "$ENV_FILE" ]] || { echo "❌ Env file not found: $ENV_FILE"; exit 2; }
+[[ -f "\$ENV_FILE" ]] || { echo "❌ Env file not found: \$ENV_FILE"; exit 2; }
 
-if ! [[ "$NEW_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-  echo "❌ Invalid IP format: $NEW_IP"
+if ! [[ "\$NEW_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]]; then
+  echo "❌ Invalid IP format: \$NEW_IP"
   exit 3
 fi
 
-START_TS="$(date +'%Y-%m-%d %H:%M:%S')"
+START_TS="\$(date +'%Y-%m-%d %H:%M:%S')"
 
-echo "→ Updating IP to: $NEW_IP"
-if grep -q '^IP=' "$ENV_FILE"; then
-  sed -i "s/^IP=.*/IP=${NEW_IP}/" "$ENV_FILE"
+echo "→ Updating IP to: \$NEW_IP"
+if grep -q '^IP=' "\$ENV_FILE"; then
+  sed -i "s/^IP=.*/IP=\${NEW_IP}/" "\$ENV_FILE"
 else
-  echo "IP=${NEW_IP}" >> "$ENV_FILE"
+  echo "IP=\${NEW_IP}" >> "\$ENV_FILE"
 fi
 
-echo "→ Restarting ${SERVICE}.service ..."
+echo "→ Restarting \${SERVICE}.service ..."
 systemctl daemon-reload
-systemctl restart "${SERVICE}.service"
+systemctl restart "\${SERVICE}.service"
 sleep 1
 
 echo
-systemctl --no-pager --full status "${SERVICE}.service" | sed -n '1,28p' || true
+systemctl --no-pager --full status "\${SERVICE}.service" | sed -n '1,28p' || true
 
-MODE="$(grep -E '^MODE=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-LPORT="$(grep -E '^LPORT=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-RPORT="$(grep -E '^RPORT=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-USER="$(grep -E '^USER=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-IP="$(grep -E '^IP=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-PORT="$(grep -E '^PORT=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-KEY="$(grep -E '^KEY=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
-KNOWN="$(grep -E '^KNOWN=' "$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+MODE="\$(grep -E '^MODE=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+LPORT="\$(grep -E '^LPORT=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+RPORT="\$(grep -E '^RPORT=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+USER="\$(grep -E '^USER=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+IP="\$(grep -E '^IP=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+PORT="\$(grep -E '^PORT=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+KEY="\$(grep -E '^KEY=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
+KNOWN="\$(grep -E '^KNOWN=' "\$ENV_FILE" | head -n1 | cut -d= -f2 || true)"
 
 echo
-if [[ "${MODE:-L}" = "L" ]]; then
-  if command -v ss >/dev/null 2>&1 && ss -lntH "sport = :${LPORT}" | grep -q .; then
-    echo "✅ Tunnel is listening locally on ${LHOST}:${LPORT}"
+if [[ "\${MODE:-L}" = "L" ]]; then
+  if command -v ss >/dev/null 2>&1 && ss -lntH "sport = :\${LPORT}" | grep -q .; then
+    echo "✅ Tunnel is listening locally on \${LHOST}:\${LPORT}"
   else
-    echo "❌ Tunnel not listening locally on ${LHOST}:${LPORT}"
-    journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true
+    echo "❌ Tunnel not listening locally on \${LHOST}:\${LPORT}"
+    journalctl -u "\${SERVICE}.service" -b --since "\${START_TS}" -n 200 --no-pager || true
     exit 4
   fi
 else
-  # MODE=R: verify remote listener exists (retry)
   for i in 1 2 3 4 5; do
-    if timeout 10 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
+    if timeout 10 ssh -p "\${PORT}" -i "\${KEY}" "\${USER}@\${IP}" \
       -o BatchMode=yes \
       -o StrictHostKeyChecking=no \
-      -o UserKnownHostsFile="${KNOWN}" \
+      -o UserKnownHostsFile="\${KNOWN}" \
       -o PreferredAuthentications=publickey \
       -o PubkeyAuthentication=yes \
       -o PasswordAuthentication=no \
       -o KbdInteractiveAuthentication=no \
       -o IdentitiesOnly=yes \
-      "command -v ss >/dev/null 2>&1 && ss -lntH \"sport = :${RPORT}\" | grep -q LISTEN" >/dev/null 2>&1; then
-      echo "✅ Tunnel is listening on remote OUTSIDE port ${RPORT}"
+      "command -v ss >/dev/null 2>&1 && ss -lntH \\"sport = :\${RPORT}\\" | grep -q LISTEN" >/dev/null 2>&1; then
+      echo "✅ Tunnel is listening on remote OUTSIDE port \${RPORT}"
       exit 0
     fi
     sleep 2
   done
 
-  echo "❌ Tunnel not listening on remote OUTSIDE port ${RPORT}"
-  journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true
+  echo "❌ Tunnel not listening on remote OUTSIDE port \${RPORT}"
+  journalctl -u "\${SERVICE}.service" -b --since "\${START_TS}" -n 200 --no-pager || true
   exit 4
 fi
 EOF
@@ -191,9 +255,6 @@ write_unit(){
     DESC="REMOTE ${RHOST}:${RPORT} -> LOCAL ${LHOST}:${LPORT}"
   fi
 
-  # IMPORTANT:
-  # - No \${...} in unit file (systemd escape bug)
-  # - Use bash -lc so normal ${VAR} expands at runtime
   cat >"$UNIT_FILE" <<EOF
 [Unit]
 Description=HUNTEX Turbo AutoSSH Tunnel (MODE=${MODE} | ${DESC} via ${USER}@${IP}:${PORT})
@@ -212,22 +273,11 @@ Environment=AUTOSSH_POLL=10
 Environment=AUTOSSH_FIRST_POLL=5
 Environment=AUTOSSH_LOGLEVEL=0
 
-# Prepare log + ssh dir (truncate log each start)
 ExecStartPre=/bin/bash -lc 'mkdir -p /root/.ssh; chmod 700 /root/.ssh; : > "${LOGFILE}"; chmod 600 "${LOGFILE}" || true'
-
-# Fail if local port already in use (only MODE=L)
 ExecStartPre=/bin/bash -lc 'if [[ "${MODE}" = "L" ]] && command -v ss >/dev/null 2>&1; then ss -lntH "sport = :${LPORT}" | grep -q . && { echo "Port ${LPORT} already in use" >> "${LOGFILE}"; exit 1; } || true; fi'
-
-# TCP reachability to outside SSH port
 ExecStartPre=/bin/bash -lc 'timeout 5 bash -lc "cat </dev/null >/dev/tcp/${IP}/${PORT}" >/dev/null 2>&1 || { echo "TCP ${IP}:${PORT} unreachable" >> "${LOGFILE}"; exit 2; }'
-
-# Refresh dedicated known_hosts (no prompt ever)
 ExecStartPre=/bin/bash -lc 'rm -f "${KNOWN}" || true; timeout 7 ssh-keyscan -p "${PORT}" -H "${IP}" > "${KNOWN}" 2>/dev/null || true; chmod 600 "${KNOWN}" || true'
-
-# Fail-fast key existence
 ExecStartPre=/bin/bash -lc '[[ -f "${KEY}" ]] || { echo "Missing KEY: ${KEY}" >> "${LOGFILE}"; exit 3; }; chmod 600 "${KEY}" || true'
-
-# Fail-fast key-only auth test
 ExecStartPre=/bin/bash -lc 'timeout 12 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
 -o BatchMode=yes \
 -o StrictHostKeyChecking=no \
@@ -242,7 +292,6 @@ ExecStartPre=/bin/bash -lc 'timeout 12 ssh -p "${PORT}" -i "${KEY}" "${USER}@${I
 -o ConnectionAttempts=1 \
 "echo AUTH_OK" >> "${LOGFILE}" 2>&1 || { echo "Key auth failed" >> "${LOGFILE}"; tail -n 80 "${LOGFILE}" || true; exit 4; }'
 
-# Main tunnel
 ExecStart=/bin/bash -lc '/usr/bin/autossh -M 0 -N \
 -p "${PORT}" \
 -i "${KEY}" \
@@ -285,8 +334,6 @@ enable_start(){
 
   systemctl daemon-reload
   systemctl enable "${SERVICE}.service" >/dev/null 2>&1 || true
-
-  # IMPORTANT: always restart so new MODE/args apply
   systemctl restart "${SERVICE}.service"
 
   echo
@@ -303,7 +350,6 @@ enable_start(){
       exit 5
     fi
   else
-    # MODE=R: verify remote listener exists (retry)
     local i
     for i in 1 2 3 4 5; do
       if timeout 10 ssh -p "${PORT}" -i "${KEY}" "${USER}@${IP}" \
@@ -322,41 +368,64 @@ enable_start(){
       sleep 2
     done
 
-    warn "Tunnel may not be listening remotely yet. Showing logs:"  
-    journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true  
-    tail -n 120 "${LOGFILE}" 2>/dev/null || true  
+    warn "Tunnel may not be listening remotely yet. Showing logs:"
+    journalctl -u "${SERVICE}.service" -b --since "${START_TS}" -n 200 --no-pager || true
+    tail -n 120 "${LOGFILE}" 2>/dev/null || true
     exit 5
-
   fi
 }
 
 main(){
   need_root
-  validate_mode
-  install_pkgs
-  ensure_prereqs
-  ensure_key
+  _full_reset_screen
 
-  log "[] MODE=${MODE}"
-  log "[] Using NAME=${NAME}"
-  log "[] KEY=${KEY}"
-  log "[] OUTSIDE=${USER}@${IP}:${PORT}"
-
+  _box "HUNTEX Turbo AutoSSH Tunnel" "Silver + Mustard (Install + Verify)"
+  printf "%s•%s OUTSIDE:%s %s@%s:%s%s\n" \
+    "${DIM}${SILVER}" "${RESET}" "${RESET}" \
+    "${SILVER}${USER}${RESET}" "${SILVER}${IP}${RESET}" "${MUSTARD}${PORT}${RESET}" "${RESET}"
   if [[ "${MODE}" = "L" ]]; then
-    log "[] LOCAL LISTEN=${LHOST}:${LPORT} -> OUTSIDE TARGET=${RHOST}:${RPORT}"
+    printf "%s•%s MODE:%s %s  %s→%s %s\n" \
+      "${DIM}${SILVER}" "${RESET}" "${RESET}" \
+      "${MUSTARD}L${RESET}" \
+      "${SILVER}${LHOST}:${LPORT}${RESET}" "${RESET}" "${SILVER}${RHOST}:${RPORT}${RESET}"
   else
-    log "[] REMOTE LISTEN=${RHOST}:${RPORT} -> LOCAL TARGET=${LHOST}:${LPORT}"
+    printf "%s•%s MODE:%s %s  %s→%s %s\n" \
+      "${DIM}${SILVER}" "${RESET}" "${RESET}" \
+      "${MUSTARD}R${RESET}" \
+      "${SILVER}${RHOST}:${RPORT}${RESET}" "${RESET}" "${SILVER}${LHOST}:${LPORT}${RESET}"
   fi
+  _hr
 
+  phase "Phase 0 — Validate"
+  validate_mode
+  ok "mode OK"
+
+  phase "Phase 1 — Packages"
+  install_pkgs
+  ok "packages ready"
+
+  phase "Phase 2 — Prerequisites"
+  ensure_prereqs
+  ok "prereqs OK"
+
+  phase "Phase 3 — SSH key"
+  ensure_key
+  ok "key OK"
+
+  phase "Phase 4 — Env + CLI"
   write_env
   write_setip
+
+  phase "Phase 5 — systemd unit"
   write_unit
+
+  phase "Phase 6 — Start + Verify"
   enable_start
 
-  echo
+  _hr
   ok "DONE"
-  echo "Logs: ${LOGFILE}"
-  echo "Change IP later: huntex-set-ip NEW_IP"
+  printf "%sLogs:%s %s\n" "${DIM}${SILVER}" "${RESET}" "${SILVER}${LOGFILE}${RESET}"
+  printf "%sChange IP:%s %s\n" "${DIM}${SILVER}" "${RESET}" "${SILVER}huntex-set-ip NEW_IP${RESET}"
 }
 
 main "$@"
