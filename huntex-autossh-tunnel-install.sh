@@ -94,52 +94,7 @@ LOGFILE="/var/log/${SERVICE}.log"
 install_pkgs(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y >/dev/null 2>&1 || true
-  apt-get install -y autossh openssh-client ca-certificates coreutils iproute2 procps >/dev/null 2>&1 || true
-
-  # -------------------- LIMIT TUNING (IRAN) --------------------
-  # هدف: جلوگیری از لگ/قطعی در بار بالا (FD + backlog + port range + keepalive)
-  # کاملاً مینیمال و امن (بدون دستکاری‌های ریسکی مثل tcp_tw_reuse)
-  local SYSCTL_FILE="/etc/sysctl.d/99-huntex-tunnel.conf"
-  cat >"${SYSCTL_FILE}" <<'EOF'
-# HUNTEX tunnel tuning (IRAN)
-# raise file descriptor ceilings
-fs.file-max = 2097152
-fs.nr_open  = 2097152
-
-# accept queue/backlog for bursts
-net.core.somaxconn = 65535
-net.core.netdev_max_backlog = 16384
-net.ipv4.tcp_max_syn_backlog = 8192
-
-# ephemeral ports for many outgoing conns
-net.ipv4.ip_local_port_range = 10240 65535
-
-# quicker cleanup + stable keepalive (helps long-lived tunnels)
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 6
-
-# faster fail on dead paths (reduce long stalls)
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_synack_retries = 3
-EOF
-
-  # apply sysctl best-effort (some VPS kernels may not expose all knobs)
-  if command -v sysctl >/dev/null 2>&1; then
-    sysctl --system >/dev/null 2>&1 || true
-  fi
-
-  # shell/session limits (useful for interactive tools; systemd gets its own LimitNOFILE below)
-  local LIMITS_FILE="/etc/security/limits.d/99-huntex-nofile.conf"
-  cat >"${LIMITS_FILE}" <<'EOF'
-# HUNTEX nofile (IRAN)
-*    soft  nofile  1048576
-*    hard  nofile  1048576
-root soft  nofile  1048576
-root hard  nofile  1048576
-EOF
-  # -----------------------------------------------------------
+  apt-get install -y autossh openssh-client ca-certificates coreutils iproute2 >/dev/null 2>&1 || true
 }
 
 ensure_prereqs(){
@@ -225,13 +180,6 @@ EnvironmentFile=${ENV_FILE}
 
 Environment=AUTOSSH_GATETIME=0
 
-# -------------------- LIMITS (IRAN) --------------------
-# prevent FD exhaustion under load; avoid random drops/rejects
-LimitNOFILE=1048576
-LimitNPROC=1048576
-TasksMax=infinity
-# ------------------------------------------------------
-
 ExecStartPre=/usr/bin/install -d -m 700 /root/.ssh
 ExecStartPre=/usr/bin/install -m 600 /dev/null \${LOGFILE}
 ExecStartPre=/usr/bin/rm -f \${KNOWN}
@@ -239,8 +187,9 @@ ExecStartPre=/bin/bash -lc '/usr/bin/ssh-keyscan -p "\${PORT}" -H "\${IP}" > "\$
 ExecStartPre=/usr/bin/chmod 600 \${KNOWN}
 ExecStartPre=/usr/bin/test -f \${KEY}
 
-StandardOutput=append:\${LOGFILE}
-StandardError=append:\${LOGFILE}
+# FIX: systemd روی بعضی سرورها ${LOGFILE} رو اینجا قبول نمی‌کنه → باید مسیر absolute باشد
+StandardOutput=append:/var/log/huntex-autossh-tunnel.log
+StandardError=append:/var/log/huntex-autossh-tunnel.log
 
 ExecStart=/usr/bin/autossh -M 0 -N \\
   -p "\${PORT}" \\
