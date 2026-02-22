@@ -729,4 +729,17 @@ USAGE
 }
 
 main() {
-  local cmd="${
+  local cmd="${1:-}"
+  case "$cmd" in
+    install)   install_cmd ;;
+    restart)   restart_only_cmd ;;
+    status)    status_cmd ;;
+    logs)      logs_cmd ;;
+    uninstall) uninstall_cmd ;;
+    ""|-h|--help|help) usage ;;
+    *) die "Unknown command: $cmd (use: install/restart/status/logs/uninstall)" ;;
+  esac
+}
+
+need_root
+main "$@"
