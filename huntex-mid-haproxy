@@ -190,7 +190,7 @@ net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.ip_local_port_range = 10240 65535
 net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_tw_reuse = 0
 
 # Keepalive (safe)
 net.ipv4.tcp_keepalive_time = 60
@@ -239,10 +239,10 @@ defaults
     option  dontlognull
     option  tcpka
 
-    timeout connect 5s
-    timeout client  2m
-    timeout server  2m
-    timeout tunnel  2m
+    timeout connect 10s
+    timeout client  30m
+    timeout server  30m
+    timeout tunnel  30m
 
 frontend fe_mid_in
     bind ${BIND_ADDR}:${PORT}
@@ -252,7 +252,7 @@ frontend fe_mid_in
 backend be_out
     mode tcp
     option tcp-check
-    default-server inter 2s fall 2 rise 2 on-marked-down shutdown-sessions
+    default-server inter 5s fall 3 rise 2 on-marked-down shutdown-sessions
     server out1 ${OUT_IP}:${PORT} check
 EOF
 }
